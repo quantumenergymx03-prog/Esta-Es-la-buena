@@ -17,6 +17,7 @@ mpl.rcParams["axes.unicode_minus"] = False
 import os
 import colorsys
 from typing import Optional, Tuple, Dict, Any, List
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  # Needed for 3D projections
 # --- PDF reportlab imports ---
 from reportlab.lib.pagesizes import A4
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle, PageBreak
@@ -827,6 +828,8 @@ class MainApp:
         # Favoritos de archivos de datos
         self.data_favorites = self._load_data_favorites()
         self.data_show_favs_only = self._get_bool_storage("data_favs_only", False)
+        # Preferencias de análisis avanzados
+        self.runup_3d_enabled = self._get_bool_storage("runup_3d_enabled", False)
 
 
 
@@ -1983,24 +1986,29 @@ class MainApp:
                 pass
             img_time = save_plot(fig1)
 
+            try:
+                fc = float(self.lf_cutoff_field.value) if getattr(self, 'lf_cutoff_field', None) and getattr(self.lf_cutoff_field, 'value', '') else 0.5
+            except Exception:
+                fc = 0.5
+            try:
+                hide_lf = bool(getattr(self, 'hide_lf_cb', None).value)
+            except Exception:
+                hide_lf = True
+            try:
+                fmax_ui = float(self.hf_limit_field.value) if getattr(self, 'hf_limit_field', None) and getattr(self.hf_limit_field, 'value', '') else None
+            except Exception:
+                fmax_ui = None
+            zoom_range = getattr(self, "_fft_zoom_range", None)
+            zmin = zmax = None
+            if zoom_range and len(zoom_range) == 2 and zoom_range[1] > zoom_range[0]:
+                try:
+                    zmin, zmax = float(zoom_range[0]), float(zoom_range[1])
+                except Exception:
+                    zmin = zmax = None
+
             top_peaks = []
             fig2, ax2 = plt.subplots(figsize=(8, 3))
             if xf is not None and mag_vel_mm is not None:
-                try:
-                    fc = float(self.lf_cutoff_field.value) if getattr(self, 'lf_cutoff_field', None) and getattr(self.lf_cutoff_field, 'value', '') else 0.5
-                except Exception:
-                    fc = 0.5
-                try:
-                    hide_lf = bool(getattr(self, 'hide_lf_cb', None).value)
-                except Exception:
-                    hide_lf = True
-                zoom_range = getattr(self, "_fft_zoom_range", None)
-                zmin = zmax = None
-                if zoom_range and len(zoom_range) == 2 and zoom_range[1] > zoom_range[0]:
-                    try:
-                        zmin, zmax = float(zoom_range[0]), float(zoom_range[1])
-                    except Exception:
-                        zmin = zmax = None
                 mask_vis = np.ones_like(xf, dtype=bool)
                 if hide_lf:
                     mask_vis &= xf >= max(0.0, fc)
@@ -2096,32 +2104,12 @@ class MainApp:
                 xf_env = res.get('envelope', {}).get('f_hz', None)
                 env_amp = res.get('envelope', {}).get('amp', None)
                 if xf_env is not None and env_amp is not None and len(xf_env) > 0:
-                    # Filtros visuales como en FFT
-                    try:
-                        fc = float(self.lf_cutoff_field.value) if getattr(self, 'lf_cutoff_field', None) and getattr(self.lf_cutoff_field, 'value', '') else 0.5
-                    except Exception:
-                        fc = 0.5
-                    try:
-                        hide_lf = bool(getattr(self, 'hide_lf_cb', None).value)
-                    except Exception:
-                        hide_lf = True
-                    try:
-                        fmax_ui = float(self.hf_limit_field.value) if getattr(self, 'hf_limit_field', None) and getattr(self.hf_limit_field, 'value', '') else None
-                    except Exception:
-                        fmax_ui = None
                     if hide_lf:
                         m_env = xf_env >= max(0.0, fc)
                     else:
                         m_env = np.ones_like(xf_env, dtype=bool)
                     if fmax_ui and fmax_ui > 0:
                         m_env = m_env & (xf_env <= fmax_ui)
-                    zoom_range = getattr(self, "_fft_zoom_range", None)
-                    zmin = zmax = None
-                    if zoom_range and len(zoom_range) == 2 and zoom_range[1] > zoom_range[0]:
-                        try:
-                            zmin, zmax = float(zoom_range[0]), float(zoom_range[1])
-                        except Exception:
-                            zmin = zmax = None
                     if zmin is not None:
                         m_env = m_env & (xf_env >= zmin) & (xf_env <= zmax)
                     xenv = xf_env[m_env]
@@ -2158,7 +2146,6 @@ class MainApp:
                             self._place_annotations(env_ax, peak_points, peak_labels, color="#c0392b", text_color="#c0392b")
                     except Exception:
                         pass
-                    # Líneas guía teóricas (si hay)
                     try:
                         bpfo = self._fldf(getattr(self, 'bpfo_field', None))
                         bpfi = self._fldf(getattr(self, 'bpfi_field', None))
@@ -2188,6 +2175,29 @@ class MainApp:
                     img_env = save_plot(env_fig)
             except Exception:
                 img_env = None
+
+            img_runup = None
+            try:
+                runup_enabled = False
+                if getattr(self, 'runup_3d_cb', None):
+                    runup_enabled = bool(getattr(self.runup_3d_cb, 'value', False))
+                else:
+                    runup_enabled = bool(getattr(self, 'runup_3d_enabled', False))
+                if runup_enabled:
+                    zoom_tuple = (zmin, zmax) if zmin is not None else None
+                    runup_fig = self._generate_runup_3d_figure(
+                        t_seg,
+                        sig_seg,
+                        fc,
+                        hide_lf,
+                        fmax_ui,
+                        zoom_tuple,
+                        False,
+                    )
+                    if runup_fig is not None:
+                        img_runup = save_plot(runup_fig)
+            except Exception:
+                img_runup = None
 
             aux_imgs = []
             aux_selected = []
@@ -2371,6 +2381,9 @@ class MainApp:
             elements.append(Image(img_fft, width=400, height=150))
             if img_env:
                 elements.append(Image(img_env, width=400, height=150))
+            if img_runup:
+                elements.append(Paragraph("Arranque/Paro - Cascada 3D", styles['Heading2']))
+                elements.append(Image(img_runup, width=400, height=180))
 
             if aux_imgs:
                 elements.append(Paragraph("Variables auxiliares", styles['Heading2']))
@@ -3836,6 +3849,12 @@ class MainApp:
         self.hide_lf_cb = ft.Checkbox(label="Ocultar bajas frecuencias", value=True)
         self.lf_cutoff_field = ft.TextField(label="Corte LF (Hz)", value="0.5", width=100)
         self.hf_limit_field = ft.TextField(label="Máx FFT (Hz)", value="", width=120)
+        self.runup_3d_cb = ft.Checkbox(
+            label="Arranque/paro 3D",
+            value=self.runup_3d_enabled,
+            tooltip="Agrega cascada 3D para análisis de arranque y paro",
+            on_change=self._on_runup_3d_toggle,
+        )
         self.fft_zoom_text = ft.Text("Zoom FFT: completo", size=12)
         self.fft_zoom_slider = ft.RangeSlider(
             0.0,
@@ -3929,7 +3948,7 @@ class MainApp:
 
                 # Opciones de espectro (visual)
                 ft.Text("Opciones de espectro (visual):", size=14),
-                ft.Row([self.hide_lf_cb, self.lf_cutoff_field, self.hf_limit_field], spacing=10),
+                ft.Row([self.hide_lf_cb, self.lf_cutoff_field, self.hf_limit_field, self.runup_3d_cb], spacing=10, wrap=True),
                 ft.Column([self.fft_zoom_text, self.fft_zoom_slider], spacing=4),
                 ft.Row([self.db_scale_cb, self.sens_unit_dd, self.sensor_sens_field, self.gain_field], spacing=10),
                 ft.Row([self.db_ref_field, self.db_ymin_field, self.db_ymax_field], spacing=10),
@@ -4207,11 +4226,15 @@ class MainApp:
         try:
             if not marks:
                 return
+            xmin, xmax = ax.get_xlim()
+            x_span = xmax - xmin if xmax > xmin else max(abs(xmax), 1.0)
             transform = ax.get_xaxis_transform()
             used: List[Tuple[float, float]] = []
             base_y = 0.98
             step = 0.08
             bg_color = "#1b1f24" if self.is_dark_mode else "white"
+            freq_tol = 0.025 * x_span if x_span > 0 else 1.0
+            offset_values = [0.0, 0.012 * x_span, -0.012 * x_span, 0.024 * x_span, -0.024 * x_span]
             for freq, label, color in marks:
                 try:
                     freq = float(freq)
@@ -4223,11 +4246,20 @@ class MainApp:
                     continue
                 slot = base_y
                 attempts = 0
-                while used and any(abs(slot - other_y) < 0.05 for _, other_y in used) and attempts < 10:
+                offset_idx = 0
+                freq_adj = freq
+                while used and any(
+                    abs(slot - other_y) < 0.05 and abs(freq_adj - other_x) < freq_tol
+                    for other_x, other_y in used
+                ) and attempts < 40:
                     slot -= step
                     attempts += 1
+                    if slot < base_y - 4 * step:
+                        slot = base_y
+                        offset_idx = (offset_idx + 1) % len(offset_values)
+                        freq_adj = freq + offset_values[offset_idx]
                 ax.text(
-                    freq,
+                    freq_adj,
                     slot,
                     label,
                     rotation=90,
@@ -4239,9 +4271,106 @@ class MainApp:
                     bbox=dict(boxstyle="round,pad=0.15", fc=bg_color, ec="none", alpha=0.75),
                     clip_on=False,
                 )
-                used.append((freq, slot))
+                used.append((freq_adj, slot))
         except Exception:
             pass
+
+    def _generate_runup_3d_figure(
+        self,
+        t_segment: np.ndarray,
+        signal_segment: np.ndarray,
+        fc: float,
+        hide_lf: bool,
+        fmax_ui: Optional[float],
+        zoom_range: Optional[Tuple[float, float]],
+        dark_mode: bool,
+    ):
+        try:
+            t = np.asarray(t_segment, dtype=float).ravel()
+            y = np.asarray(signal_segment, dtype=float).ravel()
+            if t.size < 256 or y.size != t.size:
+                return None
+            dt = float(np.median(np.diff(t)))
+            if not (np.isfinite(dt) and dt > 0):
+                return None
+            n = y.size
+            approx = min(n, 2048)
+            if approx < 128:
+                return None
+            power = int(np.floor(np.log2(max(128, approx))))
+            nfft = int(2 ** power)
+            nfft = min(nfft, n)
+            if nfft < 128:
+                return None
+            window = np.hanning(nfft)
+            step = max(1, int(nfft * 0.25))
+            if step >= nfft:
+                step = max(1, nfft // 4)
+            spectra: List[np.ndarray] = []
+            times: List[float] = []
+            freq_axis = None
+            norm = 2.0 / float(nfft)
+            for start in range(0, n - nfft + 1, step):
+                segment = y[start:start + nfft]
+                windowed = segment * window
+                fft_vals = np.fft.rfft(windowed)
+                mag_acc = norm * np.abs(fft_vals)
+                if freq_axis is None:
+                    freq_axis = np.fft.rfftfreq(nfft, dt)
+                vel_spec = np.zeros_like(mag_acc)
+                pos = freq_axis > 0
+                vel_spec[pos] = (mag_acc[pos] / (2.0 * np.pi * freq_axis[pos])) * 1000.0
+                spectra.append(vel_spec)
+                seg_t = t[start:start + nfft]
+                times.append(float(np.mean(seg_t)))
+            if not spectra or freq_axis is None:
+                return None
+            spec_arr = np.vstack(spectra)
+            times_arr = np.asarray(times, dtype=float)
+            freq_mask = np.ones_like(freq_axis, dtype=bool)
+            if hide_lf:
+                freq_mask &= freq_axis >= max(0.0, fc)
+            if fmax_ui and fmax_ui > 0:
+                freq_mask &= freq_axis <= float(fmax_ui)
+            if zoom_range and zoom_range[1] > zoom_range[0]:
+                freq_mask &= (freq_axis >= zoom_range[0]) & (freq_axis <= zoom_range[1])
+            if not np.any(freq_mask):
+                freq_mask = np.ones_like(freq_axis, dtype=bool)
+            freq_sel = freq_axis[freq_mask]
+            amp = spec_arr[:, freq_mask].T  # freq x time
+            if freq_sel.size == 0 or amp.size == 0:
+                return None
+            fig = plt.figure(figsize=(10, 6))
+            face = "#0f141b" if dark_mode else "white"
+            fig.patch.set_facecolor(face)
+            ax = fig.add_subplot(111, projection="3d")
+            ax.set_facecolor(face)
+            T, F = np.meshgrid(times_arr, freq_sel)
+            surf = ax.plot_surface(T, F, amp, cmap="viridis", linewidth=0, antialiased=True)
+            ax.set_xlabel("Tiempo (s)")
+            ax.set_ylabel("Frecuencia (Hz)")
+            ax.set_zlabel("Velocidad [mm/s]")
+            ax.set_title("Arranque/Paro - Cascada 3D")
+            try:
+                vmax = float(np.nanmax(amp))
+                if np.isfinite(vmax) and vmax > 0:
+                    ax.set_zlim(0.0, vmax * 1.05)
+            except Exception:
+                pass
+            ax.view_init(elev=32, azim=-130)
+            axis_color = "white" if dark_mode else "black"
+            ax.xaxis.label.set_color(axis_color)
+            ax.yaxis.label.set_color(axis_color)
+            ax.zaxis.label.set_color(axis_color)
+            ax.title.set_color(axis_color)
+            for axis in [ax.xaxis, ax.yaxis, ax.zaxis]:
+                for tick in axis.get_ticklabels():
+                    tick.set_color(axis_color)
+            fig.colorbar(surf, ax=ax, shrink=0.6, pad=0.1, label="Velocidad [mm/s]")
+            fig.tight_layout()
+            return fig
+        except Exception:
+            return None
 
     def _format_fft_zoom_label(self, start: float, end: float, full_range: Tuple[float, float]) -> str:
         min_val, max_val = full_range
@@ -5311,6 +5440,25 @@ class MainApp:
             except Exception:
                 env_chart = None
 
+            runup_chart = None
+            try:
+                if getattr(self, 'runup_3d_cb', None) and getattr(self.runup_3d_cb, 'value', False):
+                    zoom_tuple = (zmin, zmax) if zmin is not None else None
+                    runup_fig = self._generate_runup_3d_figure(
+                        t_segment,
+                        signal_segment,
+                        fc,
+                        hide_lf,
+                        fmax_ui,
+                        zoom_tuple,
+                        self.is_dark_mode,
+                    )
+                    if runup_fig is not None:
+                        runup_chart = MatplotlibChart(runup_fig, expand=True, isolated=True)
+                        plt.close(runup_fig)
+            except Exception:
+                runup_chart = None
+
 
             # --- Gráficas auxiliares ---
 
@@ -5442,23 +5590,26 @@ class MainApp:
 
                     controls=[
                         resumen_exec,
-                        ft.Container(
-                            content=ft.Column([
-                                ft.Text("Explicación y revisiones sugeridas", size=16, weight="bold"),
-                                *[ft.Text(f"- {it}") for it in exp_lines],
-                            ], spacing=6),
-                            bgcolor=ft.Colors.with_opacity(0.05, self._accent_ui()),
-                            border_radius=10,
-                            padding=10,
-                        ),
-                        ft.Text(_fft_filter_note),
-                        chart
-                    ] + ([env_chart] if 'env_chart' in locals() and env_chart else []) + aux_plots,
-                    spacing=20,
+                    ft.Container(
+                        content=ft.Column([
+                            ft.Text("Explicación y revisiones sugeridas", size=16, weight="bold"),
+                            *[ft.Text(f"- {it}") for it in exp_lines],
+                        ], spacing=6),
+                        bgcolor=ft.Colors.with_opacity(0.05, self._accent_ui()),
+                        border_radius=10,
+                        padding=10,
+                    ),
+                    ft.Text(_fft_filter_note),
+                    chart
+                ]
+                    + ([runup_chart] if runup_chart else [])
+                    + ([env_chart] if 'env_chart' in locals() and env_chart else [])
+                    + aux_plots,
+                spacing=20,
 
-                    scroll="auto",   # 👈 scroll vertical aquí (válido en Column)
+                scroll="auto",   # 👈 scroll vertical aquí (válido en Column)
 
-                    expand=True
+                expand=True
 
                 )
             )
@@ -6715,6 +6866,18 @@ class MainApp:
         if self.page:
 
             self.page.update()
+
+    def _on_runup_3d_toggle(self, e=None):
+        try:
+            enabled = bool(getattr(self, 'runup_3d_cb', None).value)
+        except Exception:
+            enabled = False
+        self.runup_3d_enabled = enabled
+        try:
+            self.page.client_storage.set("runup_3d_enabled", self.runup_3d_enabled)
+        except Exception:
+            pass
+        self._update_analysis()
 
 
 
