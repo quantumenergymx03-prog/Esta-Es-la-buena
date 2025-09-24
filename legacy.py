@@ -790,6 +790,7 @@ class MainApp:
         self.fft_plot_color = self._get_color_pref("fft_plot_color", self._accent_ui())
         self.combine_signals_enabled = self._get_bool_storage("combine_signals_enabled", False)
         self._last_combined_sources: List[str] = []
+        self._current_signal_label: Optional[str] = None
 
 
 
@@ -1716,6 +1717,65 @@ class MainApp:
         except Exception:
             return None
 
+    def _get_time_signal_data(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[str]]:
+        """
+        Obtiene la columna de tiempo y la señal principal considerando la opción de
+        combinar señales seleccionadas mediante RMS vectorial.
+        Devuelve: (tiempo, señal, etiqueta_para_graficas)
+        """
+        if self.current_df is None or getattr(self.current_df, "empty", True):
+            return None, None, None
+
+        time_col = getattr(self.time_dropdown, "value", None)
+        signal_col = getattr(self.fft_dropdown, "value", None)
+        if not time_col or not signal_col:
+            return None, None, None
+        if time_col not in self.current_df.columns or signal_col not in self.current_df.columns:
+            return None, None, None
+
+        time_series = pd.to_numeric(self.current_df[time_col], errors="coerce")
+        signal_series = pd.to_numeric(self.current_df[signal_col], errors="coerce")
+        t = time_series.to_numpy(dtype=float)
+        signal = np.nan_to_num(signal_series.to_numpy(dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+
+        combined_label = signal_col
+        combined_sources: List[str] = []
+
+        if getattr(self, "combine_signals_enabled", False):
+            selected_cols = self._collect_selected_signals()
+            if selected_cols:
+                if signal_col not in selected_cols:
+                    selected_cols.append(signal_col)
+            else:
+                selected_cols = [signal_col]
+            valid_cols = [col for col in selected_cols if col in self.current_df.columns and col != time_col]
+            # Eliminar duplicados preservando orden
+            valid_cols = list(dict.fromkeys(valid_cols))
+
+            combined = None
+            if len(valid_cols) >= 2:
+                combined = self._build_combined_signal(valid_cols)
+            if combined is not None and combined.shape[0] == signal.shape[0]:
+                signal = combined
+                combined_sources = valid_cols
+                combined_label = f"RMS({', '.join(valid_cols)})"
+
+        prev_sources = getattr(self, "_last_combined_sources", [])
+        if combined_sources != prev_sources:
+            self._last_combined_sources = combined_sources
+            try:
+                if combined_sources:
+                    self._log(
+                        "Señal principal combinada mediante RMS vectorial: "
+                        + ", ".join(combined_sources)
+                    )
+                elif prev_sources:
+                    self._log("Se utiliza una única columna como señal principal.")
+            except Exception:
+                pass
+
+        return t, signal, combined_label
+
     # Helpers de lectura segura de campos
     def _fldf(self, fld):
         try:
@@ -1856,8 +1916,14 @@ class MainApp:
             plt.style.use("seaborn-v0_8-whitegrid")
             plt.rcParams["font.family"] = "DejaVu Sans"
 
-            t = self.current_df[time_col].to_numpy()
-            signal = self.current_df[fft_signal_col].to_numpy()
+            data_tuple = self._get_time_signal_data()
+            if not data_tuple or data_tuple[0] is None or data_tuple[1] is None:
+                self._log("No se pudo obtener la señal principal para exportar.")
+                return
+
+            t, signal, signal_label = data_tuple
+            if signal_label is None:
+                signal_label = fft_signal_col
 
             try:
                 start_t = float(self.start_time_field.value) if getattr(self.start_time_field, "value", None) else t[0]
@@ -2014,7 +2080,7 @@ class MainApp:
             fig1, ax1 = plt.subplots(figsize=(8, 3))
             if len(t_seg) > 0:
                 ax1.plot(t_seg, sig_seg, color=self.time_plot_color)
-            ax1.set_title(f"Señal {fft_signal_col} ({start_t:.2f}-{end_t:.2f}s)")
+            ax1.set_title(f"Señal {signal_label} ({start_t:.2f}-{end_t:.2f}s)")
             ax1.set_xlabel("Tiempo (s)")
             ax1.set_ylabel("Aceleración [m/s²]")
             try:
@@ -3321,9 +3387,15 @@ class MainApp:
 
             fft_signal_col = self.fft_dropdown.value
 
-            t = self.current_df[time_col].to_numpy()
+            data_tuple = self._get_time_signal_data()
+            if not data_tuple or data_tuple[0] is None or data_tuple[1] is None:
+                self._log("No se pudo obtener la señal principal para exportar.")
+                return
 
-            signal = self.current_df[fft_signal_col].to_numpy()
+            t, signal, signal_label = data_tuple
+
+            if signal_label is None:
+                signal_label = fft_signal_col
 
 
 
@@ -3403,7 +3475,7 @@ class MainApp:
             fig1, ax1 = plt.subplots(figsize=(8, 3))
             if len(t_seg) > 0:
                 ax1.plot(t_seg, sig_seg, color=self.time_plot_color)
-            ax1.set_title(f"Señal {fft_signal_col} ({start_t:.2f}-{end_t:.2f}s)")
+            ax1.set_title(f"Señal {signal_label} ({start_t:.2f}-{end_t:.2f}s)")
             ax1.set_xlabel("Tiempo (s)")
             ax1.set_ylabel("Aceleración [m/s²]")
             # Anotar RMS aceleración
@@ -5053,9 +5125,16 @@ class MainApp:
 
             fft_signal_col = self.fft_dropdown.value
 
-            t = self.current_df[time_col].to_numpy()
+            data_tuple = self._get_time_signal_data()
+            if not data_tuple or data_tuple[0] is None or data_tuple[1] is None:
+                return ft.Text("⚠️ No se pudo obtener la señal principal", size=14, color="#e74c3c")
 
-            signal = self.current_df[fft_signal_col].to_numpy()
+            t, signal, signal_label = data_tuple
+
+            if signal_label is None:
+                signal_label = fft_signal_col
+
+            self._current_signal_label = signal_label
 
 
 
@@ -5625,37 +5704,34 @@ class MainApp:
 
             # --- Panel resumen + diagnóstico ---
 
+            combined_sources = list(getattr(self, "_last_combined_sources", []) or [])
+            summary_items: List[ft.Control] = [
+                ft.Text("📊 Resumen del análisis", size=18, weight="bold"),
+                ft.Text(f"Periodo: {start_t:.2f}s – {end_t:.2f}s"),
+            ]
+            if signal_label:
+                summary_items.append(ft.Text(f"Señal analizada: {signal_label}"))
+            if combined_sources:
+                summary_items.append(
+                    ft.Text("Componentes combinados (RMS): " + ", ".join(combined_sources))
+                )
+            summary_items.extend([
+                ft.Text(f"Frecuencia dominante: {dom_freq:.2f} Hz"),
+                ft.Text(f"RMS velocidad: {rms_mm:.3f} mm/s"),
+                ft.Text(
+                    "Crest factor (aceleración): "
+                    f"{(float(np.max(np.abs(signal_segment))) / (float(self._calculate_rms(signal_segment)) + 1e-12)):.2f}"
+                ),
+                ft.Divider(),
+                ft.Text("🩺 Diagnóstico automático (baseline)", size=16, weight="bold"),
+                *[ft.Text(f"• {it}") for it in findings],
+            ])
+
             resumen = ft.Container(
-
-                content=ft.Column([
-
-                    ft.Text("📊 Resumen del análisis", size=18, weight="bold"),
-
-                    ft.Text(f"Periodo: {start_t:.2f}s – {end_t:.2f}s"),
-
-                    ft.Text(f"Frecuencia dominante: {dom_freq:.2f} Hz"),
-
-                    ft.Text(f"RMS velocidad: {rms_mm:.3f} mm/s"),
-
-                    ft.Text(
-                        f"Crest factor (aceleración): "
-                        f"{(float(np.max(np.abs(signal_segment))) / (float(self._calculate_rms(signal_segment)) + 1e-12)):.2f}"
-                    ),
-
-                    ft.Divider(),
-
-                    ft.Text("🩺 Diagnóstico automático (baseline)", size=16, weight="bold"),
-
-                    *[ft.Text(f"• {it}") for it in findings],
-
-                ], spacing=6),
-
+                content=ft.Column(summary_items, spacing=6),
                 bgcolor=ft.Colors.with_opacity(0.05, self._accent_ui()),
-
                 border_radius=10,
-
                 padding=10
-
             )
 
 
