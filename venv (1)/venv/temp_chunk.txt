@@ -1,0 +1,55 @@
+            severity_label_ms = res['severity']['label']
+            severity_color_ms = res['severity']['color']
+            findings = res['diagnosis']
+            # Explicación y revisiones sugeridas (basado en hallazgos y métricas)
+            exp_lines = []
+            # Reducir hallazgos a los principales (para explicaciones)
+            try:
+                _sel = self._select_main_findings(findings)
+            except Exception:
+                _sel = findings
+            findings = _sel
+            # Enfoque explícito: motor eléctrico
+            exp_lines.append("Enfoque: motor eléctrico")
+            try:
+                en = res.get('fft', {}).get('energy', {})
+                e_total = float(en.get('total', 1e-12))
+                frac_low = (float(en.get('low', 0.0)) / e_total) if e_total > 0 else 0.0
+                frac_mid = (float(en.get('mid', 0.0)) / e_total) if e_total > 0 else 0.0
+                frac_high = (float(en.get('high', 0.0)) / e_total) if e_total > 0 else 0.0
+            except Exception:
+                frac_low = frac_mid = frac_high = 0.0
+            try:
+                exp_lines.append(f"Severidad por RMS de velocidad (ISO): {rms_mm:.3f} mm/s ? {severity_label_ms}.")
+            except Exception:
+                pass
+            def _has(txt: str) -> bool:
+                try:
+                    return any((txt in s) for s in (findings or []))
+                except Exception:
+                    return False
+            if _has("Desbalanceo"):
+                exp_lines.append("Motivo: 1X dominante, 2X/3X bajos y energía concentrada en baja frecuencia.")
+                exp_lines.append("Revisar: balanceo del rotor/acoplamiento, fijaciones y suciedad/excentricidad.")
+            if _has("Desalineaci"):
+                exp_lines.append("Motivo: armónicos 2X/3X elevados respecto a 1X.")
+                exp_lines.append("Revisar: alineación de ejes, calces y planitud de la base.")
+            if _has("Engranes"):
+                exp_lines.append("Motivo: componente de malla de engranajes apreciable.")
+                exp_lines.append("Revisar: desgaste de dientes, juego y lubricación.")
+            if _has("Rodamientos"):
+                exp_lines.append("Motivo: picos en envolvente en frecuencias características de rodamientos.")
+                exp_lines.append("Revisar: lubricación, holgura y posible daño en pistas/elementos.")
+            if _has("Elctrico") or _has("Eléctrico") or _has("El?ctrico"):
+                exp_lines.append("Motivo: componentes a frecuencia de línea y/o su 2x.")
+                exp_lines.append("Revisar: balance de fases, variador, conexiones y carga del motor.")
+            if _has("Resonancia estructural"):
+                exp_lines.append("Motivo: picos agudos con Q alto fuera de armónicos conocidos.")
+                exp_lines.append("Revisar: rigidez/soportes, aprietes y realizar prueba modal/FRF si es posible.")
+            if frac_low + frac_mid + frac_high > 0:
+                try:
+                    exp_lines.append(f"Distribución de energía: baja {frac_low:.0%}, media {frac_mid:.0%}, alta {frac_high:.0%} (guía del tipo de fallo).")
+                except Exception:
+                    pass
+            # Guardar última FFT/segmento para diagnóstico avanzado
+            self._last_xf = xf
