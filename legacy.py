@@ -2078,27 +2078,29 @@ class MainApp:
                 return path
 
             fig1, ax1 = plt.subplots(figsize=(8, 3))
-            if len(t_seg) > 0:
-                ax1.plot(t_seg, sig_seg, color=self.time_plot_color)
+            try:
+                unit_mode = getattr(self, "time_unit_dd", None).value if getattr(self, "time_unit_dd", None) else "vel_mm"
+            except Exception:
+                unit_mode = "vel_mm"
+            if unit_mode == "vel_mm":
+                y_time = self._acc_to_vel_time_mm(sig_seg, t_seg)
+                y_label = "Velocidad [mm/s]"
+                rms_text = f"RMS vel: {self._calculate_rms(y_time):.3f} mm/s" if y_time.size else "RMS vel: 0.000 mm/s"
+            elif unit_mode == "acc_g":
+                y_time = sig_seg / 9.80665
+                y_label = "Aceleración [g]"
+                rms_text = f"RMS acc: {self._calculate_rms(y_time):.3f} g"
+            else:
+                y_time = sig_seg
+                y_label = "Aceleración [m/s²]"
+                rms_text = f"RMS acc: {self._calculate_rms(y_time):.3e} m/s²"
+            if y_time.size:
+                ax1.plot(t_seg, y_time, color=self.time_plot_color)
             ax1.set_title(f"Señal {signal_label} ({start_t:.2f}-{end_t:.2f}s)")
             ax1.set_xlabel("Tiempo (s)")
-            ax1.set_ylabel("Aceleración [m/s²]")
+            ax1.set_ylabel(y_label)
             try:
-                rms_acc = self._calculate_rms(sig_seg)
-                ax1.text(0.02, 0.95, f"RMS acc: {rms_acc:.3e} m/s²", transform=ax1.transAxes, va="top")
-            except Exception:
-                pass
-
-            # Ajustar etiqueta de eje Y segun unidad seleccionada
-            try:
-                ax1.set_ylabel(_ylabel)
-            except Exception:
-                pass
-
-            # Anotar RMS conforme a la unidad seleccionada
-            try:
-                text_color = "white" if self.is_dark_mode else "black"
-                ax1.text(0.02, 0.95, _rms_text, transform=ax1.transAxes, va="top", color=text_color)
+                ax1.text(0.02, 0.95, rms_text, transform=ax1.transAxes, va="top", color="black")
             except Exception:
                 pass
             img_time = save_plot(fig1)
@@ -3473,15 +3475,29 @@ class MainApp:
 
             # Señal principal
             fig1, ax1 = plt.subplots(figsize=(8, 3))
-            if len(t_seg) > 0:
-                ax1.plot(t_seg, sig_seg, color=self.time_plot_color)
+            try:
+                unit_mode = getattr(self, "time_unit_dd", None).value if getattr(self, "time_unit_dd", None) else "vel_mm"
+            except Exception:
+                unit_mode = "vel_mm"
+            if unit_mode == "vel_mm":
+                y_time = self._acc_to_vel_time_mm(sig_seg, t_seg)
+                y_label = "Velocidad [mm/s]"
+                rms_text = f"RMS vel: {self._calculate_rms(y_time):.3f} mm/s" if y_time.size else "RMS vel: 0.000 mm/s"
+            elif unit_mode == "acc_g":
+                y_time = sig_seg / 9.80665
+                y_label = "Aceleración [g]"
+                rms_text = f"RMS acc: {self._calculate_rms(y_time):.3f} g"
+            else:
+                y_time = sig_seg
+                y_label = "Aceleración [m/s²]"
+                rms_text = f"RMS acc: {self._calculate_rms(y_time):.3e} m/s²"
+            if y_time.size:
+                ax1.plot(t_seg, y_time, color=self.time_plot_color)
             ax1.set_title(f"Señal {signal_label} ({start_t:.2f}-{end_t:.2f}s)")
             ax1.set_xlabel("Tiempo (s)")
-            ax1.set_ylabel("Aceleración [m/s²]")
-            # Anotar RMS aceleración
+            ax1.set_ylabel(y_label)
             try:
-                rms_acc = self._calculate_rms(sig_seg)
-                ax1.text(0.02, 0.95, f"RMS acc: {rms_acc:.3e} m/s²", transform=ax1.transAxes, va="top")
+                ax1.text(0.02, 0.95, rms_text, transform=ax1.transAxes, va="top", color="black")
             except Exception:
                 pass
             img_time = save_plot(fig1)
@@ -5121,6 +5137,60 @@ class MainApp:
 
         try:
 
+            if self.current_df is None or getattr(self.current_df, "empty", True):
+
+                chart = ft.Text("⚠️ No hay datos cargados")
+
+                self.multi_chart_container.content = chart
+
+                if self.multi_chart_container.page:
+
+                    self.multi_chart_container.update()
+
+                return
+
+            if getattr(self, "combine_signals_enabled", False):
+
+                data_tuple = self._get_time_signal_data()
+
+                if not data_tuple or data_tuple[0] is None or data_tuple[1] is None:
+
+                    chart = ft.Text("⚠️ No se pudo obtener la señal combinada")
+
+                else:
+
+                    _, _, label = data_tuple
+
+                    label = label or getattr(self.fft_dropdown, "value", "Señal combinada")
+
+                    combined_sources = getattr(self, "_last_combined_sources", []) or []
+
+                    if combined_sources:
+
+                        msg = (
+
+                            f"Señal combinada en análisis: {label}. "
+
+                            + "Componentes: "
+
+                            + ", ".join(combined_sources)
+
+                        )
+
+                    else:
+
+                        msg = f"Señal analizada: {label}."
+
+                    chart = ft.Text(msg)
+
+                self.multi_chart_container.content = chart
+
+                if self.multi_chart_container.page:
+
+                    self.multi_chart_container.update()
+
+                return
+
             time_col = self.time_dropdown.value
 
             fft_signal_col = self.fft_dropdown.value
@@ -5329,7 +5399,7 @@ class MainApp:
 
             ax1.set_xlabel("Tiempo (s)")
 
-            ax1.set_ylabel("Aceleración [m/s²]")
+            ax1.set_ylabel(_ylabel)
 
             # Anotar RMS de Aceleracion (tiempo)
             try:
