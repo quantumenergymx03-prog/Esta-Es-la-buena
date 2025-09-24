@@ -1705,6 +1705,60 @@ class MainApp:
         except Exception:
             return []
 
+    def _sync_select_all_checkbox(self):
+        try:
+            select_all_cb = getattr(self, "signal_select_all_cb", None)
+            checkboxes = getattr(self, "signal_checkboxes", [])
+        except Exception:
+            return
+        if not select_all_cb:
+            return
+        try:
+            values = [bool(getattr(cb, "value", False)) for cb in checkboxes]
+            if not values:
+                new_value = False
+            elif all(values):
+                new_value = True
+            elif any(values):
+                new_value = None
+            else:
+                new_value = False
+            if select_all_cb.value != new_value:
+                select_all_cb.value = new_value
+                if select_all_cb.page:
+                    select_all_cb.update()
+        except Exception:
+            pass
+
+    def _on_select_all_signals(self, e=None):
+        try:
+            desired = bool(getattr(self.signal_select_all_cb, "value", False))
+        except Exception:
+            desired = False
+        updated = False
+        try:
+            for cb in getattr(self, "signal_checkboxes", []):
+                if getattr(cb, "value", False) != desired:
+                    cb.value = desired
+                    updated = True
+                    if cb.page:
+                        cb.update()
+        except Exception:
+            pass
+        if updated:
+            try:
+                self._update_multi_chart()
+            except Exception:
+                pass
+        self._sync_select_all_checkbox()
+
+    def _on_signal_checkbox_change(self, e=None):
+        self._sync_select_all_checkbox()
+        try:
+            self._update_multi_chart()
+        except Exception:
+            pass
+
     def _build_combined_signal(self, columns: List[str]) -> Optional[np.ndarray]:
         try:
             if not columns or self.current_df is None:
@@ -3900,9 +3954,18 @@ class MainApp:
 
         # Señales de tiempo
 
+        self.signal_select_all_cb = ft.Checkbox(
+            label="Seleccionar todas las señales",
+            value=True,
+            tristate=True,
+            on_change=self._on_select_all_signals,
+        )
+
+        default_checked = bool(getattr(self.signal_select_all_cb, "value", True))
+
         self.signal_checkboxes = [
 
-            ft.Checkbox(label=col, value=(col.startswith("a")))
+            ft.Checkbox(label=col, value=default_checked)
 
             for col in numeric_cols if col != initial_time_col
 
@@ -3942,7 +4005,9 @@ class MainApp:
 
         for cb in self.signal_checkboxes:
 
-            cb.on_change = self._update_multi_chart
+            cb.on_change = self._on_signal_checkbox_change
+
+        self._sync_select_all_checkbox()
 
 
 
@@ -4104,6 +4169,8 @@ class MainApp:
                 # Señales
 
                 ft.Text("📊 Señales en tiempo:", size=14),
+
+                ft.Row([self.signal_select_all_cb], spacing=10),
 
                 ft.Row(self.signal_checkboxes, wrap=True, spacing=10),
                 self.combine_signals_cb,
@@ -7164,170 +7231,77 @@ class MainApp:
 
 
     def _update_multi_chart(self, e=None, normalize=True):
-
-        """
-
-        Genera gráfica combinada de FFTs seleccionadas.
-
-        - normalize=True: escala cada señal entre 0–1 para ver todas.
-
-        """
-
+        """Actualiza la vista combinada mostrando una única señal en el dominio del tiempo."""
         try:
-
-            time_col = self.time_dropdown.value
-
-            t = self.current_df[time_col].to_numpy()
-
-            selected_signals = [cb.label for cb in self.signal_checkboxes if cb.value]
-
-
-
-            if not selected_signals:
-
-                chart = ft.Text("⚠️ No hay señales seleccionadas")
-
-            else:
-
-                plt.style.use('dark_background' if self.is_dark_mode else 'seaborn-v0_8-whitegrid')
-
-                fig, ax = plt.subplots(figsize=(12, 5))
-
-
-
-                # Vista en dBV real opcional (aplica a todas las curvas)
-                try:
-                    use_dbv = bool(getattr(self, 'db_scale_cb', None) and getattr(self.db_scale_cb, 'value', False))
-                except Exception:
-                    use_dbv = False
-                # Calibración para dBV
-                try:
-                    sens_unit = getattr(self, 'sens_unit_dd', None).value if getattr(self, 'sens_unit_dd', None) else 'mV/g'
-                except Exception:
-                    sens_unit = 'mV/g'
-                try:
-                    sens_val = float(getattr(self, 'sensor_sens_field', None).value) if getattr(self, 'sensor_sens_field', None) else 100.0
-                except Exception:
-                    sens_val = 100.0
-                try:
-                    gain_vv = float(getattr(self, 'gain_field', None).value) if getattr(self, 'gain_field', None) else 1.0
-                except Exception:
-                    gain_vv = 1.0
-
-                # Filtros de frecuencia visuales
-                try:
-                    fmin_ui = float(self.lf_cutoff_field.value) if getattr(self, 'lf_cutoff_field', None) and getattr(self.lf_cutoff_field, 'value', '') else 0.0
-                except Exception:
-                    fmin_ui = 0.0
-                try:
-                    fmax_ui = float(self.hf_limit_field.value) if getattr(self, 'hf_limit_field', None) and getattr(self.hf_limit_field, 'value', '') else None
-                except Exception:
-                    fmax_ui = None
-
-                for sig in selected_signals:
-
-                    y = self.current_df[sig].to_numpy()
-
-                    N = len(y)
-
-                    if N < 2:
-
-                        continue
-
-                    T = t[1] - t[0]
-
-                    yf = np.fft.fft(y)
-
-                    xf = np.fft.fftfreq(N, T)[:N // 2]
-
-                    mag_acc = 2.0 / N * np.abs(yf[0:N // 2])
-
-                    mag_vel_mm = np.zeros_like(mag_acc)
-
-                    mag_vel_mm[xf > 0] = (mag_acc[xf > 0] / (2 * np.pi * xf[xf > 0])) * 1000
-
-
-
-                    # Aplicar máscara de frecuencia
-                    mask = xf >= max(0.0, fmin_ui)
-                    if fmax_ui and fmax_ui > 0:
-                        mask = mask & (xf <= fmax_ui)
-
-                    if use_dbv:
-                        if sens_unit == 'mV/g':
-                            sens_v_per_g = sens_val * 1e-3
-                            V_amp = (mag_acc / 9.80665) * sens_v_per_g * gain_vv
-                        elif sens_unit == 'V/g':
-                            V_amp = (mag_acc / 9.80665) * sens_val * gain_vv
-                        elif sens_unit == 'mV/(mm/s)':
-                            V_amp = mag_vel_mm * (sens_val * 1e-3) * gain_vv
-                        elif sens_unit == 'V/(mm/s)':
-                            V_amp = mag_vel_mm * sens_val * gain_vv
-                        else:
-                            V_amp = mag_vel_mm * 0.0
-                        eps = 1e-12
-                        yplot = 20.0 * np.log10(np.maximum(np.asarray(V_amp, dtype=float), eps) / 1.0)
-                        ax.plot(xf[mask], yplot[mask], linewidth=2, label=sig)
+            chart = None
+            data_tuple = self._get_time_signal_data()
+            if not data_tuple or data_tuple[0] is None or data_tuple[1] is None:
+                if getattr(self, "combine_signals_enabled", False):
+                    selected = self._collect_selected_signals()
+                    if len(selected) < 2:
+                        chart = ft.Text("⚠️ Selecciona las señales que deseas unificar para graficarlas.")
                     else:
-                        if normalize and mag_vel_mm.max() > 0:
-                            mag_vel_mm = mag_vel_mm / mag_vel_mm.max()
-                        ax.plot(xf[mask], mag_vel_mm[mask], linewidth=2, label=sig)
-
-
-
-                ax.set_title("FFT combinada de señales")
-
-                ax.set_xlabel("Frecuencia (Hz)")
-
-                if use_dbv:
-                    ax.set_ylabel("Nivel [dBV]")
-                    # Rango Y en dBV si se definió
-                    try:
-                        ymin = float(self.db_ymin_field.value) if getattr(self, 'db_ymin_field', None) and getattr(self.db_ymin_field, 'value', '') != '' else None
-                    except Exception:
-                        ymin = None
-                    try:
-                        ymax = float(self.db_ymax_field.value) if getattr(self, 'db_ymax_field', None) and getattr(self.db_ymax_field, 'value', '') != '' else None
-                    except Exception:
-                        ymax = None
-                    if ymin is not None or ymax is not None:
-                        cur = ax.get_ylim()
-                        ax.set_ylim(ymin if ymin is not None else cur[0], ymax if ymax is not None else cur[1])
+                        chart = ft.Text("⚠️ No se pudo construir la señal combinada.")
                 else:
-                    ax.set_ylabel("Velocidad [mm/s]" if not normalize else "Amplitud normalizada")
-
-                try:
-                    if fmax_ui and fmax_ui > 0:
-                        ax.set_xlim(left=0.0, right=float(fmax_ui))
-                    if fmin_ui and fmin_ui > 0:
-                        cur = ax.get_xlim()
-                        ax.set_xlim(left=float(fmin_ui), right=cur[1])
-                except Exception:
-                    pass
-                ax.legend(ncol=2, fontsize=8)
-
-
-
-                chart = MatplotlibChart(fig, expand=True, isolated=True)
-
-                plt.close(fig)
-
-            self.multi_chart_container.content = chart
-
-            if self.multi_chart_container.page:
-
-                self.multi_chart_container.update()
-
+                    chart = ft.Text("⚠️ No hay señal principal disponible para graficar.")
+            else:
+                t, signal, signal_label = data_tuple
+                if signal_label is None:
+                    try:
+                        signal_label = getattr(self.fft_dropdown, "value", None)
+                    except Exception:
+                        signal_label = None
+                if t is None or signal is None or len(t) < 2 or len(signal) < 2:
+                    chart = ft.Text("⚠️ Datos insuficientes para graficar la señal en el tiempo.")
+                else:
+                    plt.style.use('dark_background' if self.is_dark_mode else 'seaborn-v0_8-whitegrid')
+                    fig, ax = plt.subplots(figsize=(12, 5))
+                    try:
+                        unit_mode = getattr(self, "time_unit_dd", None).value if getattr(self, "time_unit_dd", None) else "vel_mm"
+                    except Exception:
+                        unit_mode = "vel_mm"
+                    if unit_mode == "vel_mm":
+                        y_plot = self._acc_to_vel_time_mm(signal, t)
+                        ylabel = "Velocidad [mm/s]"
+                        rms_text = f"RMS vel: {self._calculate_rms(y_plot):.3f} mm/s" if y_plot.size else "RMS vel: 0.000 mm/s"
+                    elif unit_mode == "acc_g":
+                        y_plot = signal / 9.80665
+                        ylabel = "Aceleración [g]"
+                        rms_text = f"RMS acc: {self._calculate_rms(y_plot):.3f} g"
+                    else:
+                        y_plot = signal
+                        ylabel = "Aceleración [m/s²]"
+                        rms_text = f"RMS acc: {self._calculate_rms(y_plot):.3e} m/s²"
+                    color = self.time_plot_color or "#00bcd4"
+                    ax.plot(t, y_plot, color=color, linewidth=2, label=signal_label or "Señal principal")
+                    ax.set_title("Señal principal en el tiempo")
+                    ax.set_xlabel("Tiempo (s)")
+                    ax.set_ylabel(ylabel)
+                    try:
+                        text_color = "white" if self.is_dark_mode else "black"
+                        ax.text(0.02, 0.95, rms_text, transform=ax.transAxes, va="top", color=text_color)
+                    except Exception:
+                        pass
+                    try:
+                        if signal_label:
+                            ax.legend(loc="upper right")
+                    except Exception:
+                        pass
+                    ax.grid(True, alpha=0.25)
+                    chart = MatplotlibChart(fig, expand=True, isolated=True)
+                    plt.close(fig)
+            if chart is not None:
+                self.multi_chart_container.content = chart
+                if self.multi_chart_container.page:
+                    self.multi_chart_container.update()
         except Exception as ex:
-
-            self._log(f"Error en gráfica combinada: {ex}")
-
+            try:
+                self._log(f"Error en gráfica combinada: {ex}")
+            except Exception:
+                pass
             self.multi_chart_container.content = ft.Text(f"Error en gráfica combinada: {ex}")
-
             if self.multi_chart_container.page:
-
                 self.multi_chart_container.update()
-
 
 
 # =========================
