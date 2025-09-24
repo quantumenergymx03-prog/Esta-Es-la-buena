@@ -5224,39 +5224,13 @@ class MainApp:
 
                     chart = ft.Text("⚠️ No se pudo obtener la señal combinada")
 
-                else:
+                    self.multi_chart_container.content = chart
 
-                    _, _, label = data_tuple
+                    if self.multi_chart_container.page:
 
-                    label = label or getattr(self.fft_dropdown, "value", "Señal combinada")
+                        self.multi_chart_container.update()
 
-                    combined_sources = getattr(self, "_last_combined_sources", []) or []
-
-                    if combined_sources:
-
-                        msg = (
-
-                            f"Señal combinada en análisis: {label}. "
-
-                            + "Componentes: "
-
-                            + ", ".join(combined_sources)
-
-                        )
-
-                    else:
-
-                        msg = f"Señal analizada: {label}."
-
-                    chart = ft.Text(msg)
-
-                self.multi_chart_container.content = chart
-
-                if self.multi_chart_container.page:
-
-                    self.multi_chart_container.update()
-
-                return
+                    return
 
             time_col = self.time_dropdown.value
 
