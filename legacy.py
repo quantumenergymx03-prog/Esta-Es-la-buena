@@ -17,6 +17,7 @@ mpl.rcParams["svg.fonttype"] = "none"
 mpl.rcParams["axes.unicode_minus"] = False
 import os
 import colorsys
+import re
 from typing import Optional, Tuple, Dict, Any, List
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  # Needed for 3D projections
 # --- PDF reportlab imports ---
@@ -626,6 +627,14 @@ def analyze_vibration(
         "f1_hz": f1,
         "severity": {"label": sev_label, "color": sev_color, "rms_mm_s": rms_vel_spec_mm},
         "diagnosis": findings,
+        "line_freq_hz": line_freq_hz,
+        "gear_teeth": gear_teeth,
+        "bearing_freqs": {
+            "bpfo": bpfo_hz,
+            "bpfi": bpfi_hz,
+            "bsf": bsf_hz,
+            "ftf": ftf_hz,
+        },
     }
 
 
@@ -2576,14 +2585,23 @@ class MainApp:
             for item in []:
                 elements.append(Paragraph(f"- {item}", styles['Normal']))
 
-            # Explicacion y recomendaciones (PDF)
-            # Explicación y recomendaciones (unificadas con la app)
-            exp_lines_pdf2 = self._build_explanations(res, exec_findings)
-            elements.append(Paragraph("Explicacion y recomendaciones", styles['Heading2']))
-            for line in exp_lines_pdf2:
-                elements.append(Paragraph(f"- {line}", styles['Normal']))
-
-            
+            # Diagnóstico, revisión y recomendaciones detalladas
+            diag_pdf, review_pdf, reco_pdf = self._build_diagnostic_sections(res, exec_findings)
+            if diag_pdf:
+                elements.append(Paragraph("Diagnóstico detallado", styles['Heading2']))
+                for line in diag_pdf:
+                    elements.append(Paragraph(f"- {line}", styles['Normal']))
+                elements.append(Spacer(1, 6))
+            if review_pdf:
+                elements.append(Paragraph("Revisión sugerida", styles['Heading2']))
+                for line in review_pdf:
+                    elements.append(Paragraph(f"- {line}", styles['Normal']))
+                elements.append(Spacer(1, 6))
+            if reco_pdf:
+                elements.append(Paragraph("Recomendaciones", styles['Heading2']))
+                for line in reco_pdf:
+                    elements.append(Paragraph(f"- {line}", styles['Normal']))
+                elements.append(Spacer(1, 12))
 
             elements.append(Paragraph("Reporte de Análisis de Vibraciones", title_style))
             elements.append(Paragraph(f"Archivo: {base_name}", styles['Normal']))
@@ -4813,86 +4831,275 @@ class MainApp:
                     break
         return selected
 
-    def _build_explanations(self, res: Dict[str, Any], findings: List[str]) -> List[str]:
-        """
-        Genera una lista de líneas de "Explicación y recomendaciones" basadas en:
-        - Resultado unificado del analizador `res` (rms, severidad, energía por bandas).
-        - Hallazgos principales seleccionados (findings) para orientar motivos y revisiones.
-        """
-        lines: List[str] = []
+    def _build_diagnostic_sections(
+        self,
+        res: Dict[str, Any],
+        findings: Optional[List[str]],
+    ) -> Tuple[List[str], List[str], List[str]]:
+        """Genera listas estructuradas para diagnóstico, revisión y recomendaciones."""
+
+        diag_lines: List[str] = []
+        review_lines: List[str] = []
+        reco_lines: List[str] = []
+
+        def _append_unique(store: List[str], text: Optional[str]) -> None:
+            if text:
+                text = text.strip()
+                if text and text not in store:
+                    store.append(text)
+
+        findings = findings or []
+
         try:
-            sev = res.get('severity', {})
-            rms_mm = float(sev.get('rms_mm_s', 0.0))
-            sev_label = str(sev.get('label', 'N/D'))
+            sev = res.get("severity", {})
+            rms_mm = float(sev.get("rms_mm_s", 0.0))
+            sev_label = str(sev.get("label", "N/D"))
         except Exception:
             rms_mm = 0.0
-            sev_label = 'N/D'
+            sev_label = "N/D"
 
-        # Enfoque
-        lines.append("Enfoque: motor eléctrico")
-
-        # Severidad
+        fft = res.get("fft", {}) or {}
         try:
-            lines.append(f"Severidad por RMS de velocidad (ISO): {rms_mm:.3f} mm/s -> {sev_label}.")
+            dom_freq = float(fft.get("dom_freq_hz") or 0.0)
         except Exception:
-            pass
-
-        # Energía por bandas
+            dom_freq = 0.0
         try:
-            en = res.get('fft', {}).get('energy', {})
-            e_total = float(en.get('total', 1e-12))
-            fl = float(en.get('low', 0.0)) / e_total if e_total > 0 else 0.0
-            fm = float(en.get('mid', 0.0)) / e_total if e_total > 0 else 0.0
-            fh = float(en.get('high', 0.0)) / e_total if e_total > 0 else 0.0
-            lines.append(f"Distribución de energía: baja {fl:.0%}, media {fm:.0%}, alta {fh:.0%}.")
+            dom_amp = float(fft.get("dom_amp_mm_s") or 0.0)
         except Exception:
-            pass
+            dom_amp = 0.0
+        try:
+            r2x = float(fft.get("r2x") or 0.0)
+        except Exception:
+            r2x = 0.0
+        try:
+            r3x = float(fft.get("r3x") or 0.0)
+        except Exception:
+            r3x = 0.0
+        try:
+            f1 = float(res.get("f1_hz") or 0.0)
+        except Exception:
+            f1 = 0.0
+        try:
+            rpm = float(res.get("rpm") or 0.0)
+        except Exception:
+            rpm = 0.0
 
-        # Helper para buscar presencia robusta (variantes de acentos/codificación)
-        def _has_any(keys: List[str]) -> bool:
-            for f in (findings or []):
+        if rms_mm > 0:
+            _append_unique(diag_lines, f"RMS de velocidad {rms_mm:.3f} mm/s → {sev_label}.")
+        if dom_freq > 0 and dom_amp > 0:
+            base_line = f"Frecuencia dominante {dom_freq:.2f} Hz ({dom_amp:.2f} mm/s)."
+            if f1 > 0:
+                base_line += f" 1X estimada {f1:.2f} Hz ({f1 * 60.0:.0f} RPM)."
+            _append_unique(diag_lines, base_line)
+
+        try:
+            energy = fft.get("energy", {}) or {}
+            e_total = float(energy.get("total", 0.0))
+            if e_total > 0:
+                frac_low = float(energy.get("low", 0.0)) / e_total
+                frac_mid = float(energy.get("mid", 0.0)) / e_total
+                frac_high = float(energy.get("high", 0.0)) / e_total
+
+                def _fmt_pct(val: float) -> str:
+                    try:
+                        return f"{max(0.0, min(1.0, val)):.0%}"
+                    except Exception:
+                        return "0%"
+
+                _append_unique(
+                    diag_lines,
+                    "Distribución energética: "
+                    f"baja {_fmt_pct(frac_low)}, media {_fmt_pct(frac_mid)}, alta {_fmt_pct(frac_high)}.",
+                )
+            else:
+                frac_low = frac_mid = frac_high = 0.0
+        except Exception:
+            frac_low = frac_mid = frac_high = 0.0
+
+        def _has(keys: List[str]) -> bool:
+            for key in keys:
                 try:
-                    s = str(f)
+                    if any(key in (f or "") for f in findings):
+                        return True
                 except Exception:
                     continue
-                for k in keys:
-                    if k in s:
-                        return True
             return False
 
-        # Recomendaciones por patrón
-        if _has_any(["Desbalanceo"]):
-            lines += [
-                "Motivo: 1X dominante con 2X/3X bajos y energía LF.",
-                "Revisar: balanceo de rotor/acoplamiento, fijaciones, suciedad/excentricidad.",
-            ]
-        if _has_any(["Desalineaci", "Desalineación", "Desalineacion"]):
-            lines += [
-                "Motivo: armónicos 2X/3X elevados respecto a 1X.",
-                "Revisar: alineación de ejes, calces y base.",
-            ]
-        if _has_any(["Engranes", "Engranaje"]):
-            lines += [
-                "Motivo: componente de malla apreciable.",
-                "Revisar: desgaste, juego y lubricación.",
-            ]
-        if _has_any(["Rodamientos", "Rodamiento"]):
-            lines += [
-                "Motivo: picos en envolvente en frecuencias del rodamiento.",
-                "Revisar: lubricación, holgura y daño en pistas/elementos.",
-            ]
-        if _has_any(["Eléctrico", "Electrico", "El?ctrico", "El\u0019ctrico"]):
-            lines += [
-                "Motivo: componentes a frecuencia de línea y/o su 2x.",
-                "Revisar: balance de fases, variador, conexiones y carga del motor.",
-            ]
-        if _has_any(["Resonancia estructural", "Resonancia"]):
-            lines += [
-                "Motivo: picos agudos con Q alto.",
-                "Revisar: rigidez/apoyos, aprietes, prueba modal/FRF.",
-            ]
+        fft_peaks = fft.get("peaks", []) or []
+        df_fft = 0.0
+        try:
+            xf = fft.get("f_hz")
+            if xf is not None and len(xf) > 1:
+                df_fft = float(np.median(np.diff(np.asarray(xf, dtype=float))))
+        except Exception:
+            df_fft = 0.0
 
-        return lines
+        envelope = res.get("envelope", {}) or {}
+        env_peaks = envelope.get("peaks", []) or []
+        df_env = 0.0
+        try:
+            xf_env = envelope.get("f_hz")
+            if xf_env is not None and len(xf_env) > 1:
+                df_env = float(np.median(np.diff(np.asarray(xf_env, dtype=float))))
+        except Exception:
+            df_env = 0.0
+
+        def _nearest_fft_amp(freq: float) -> Optional[float]:
+            if not freq or freq <= 0:
+                return None
+            tol = max(0.02 * freq, (df_fft or 0.0) * 2.0 or 1.0)
+            best = 0.0
+            for pk in fft_peaks:
+                try:
+                    fpk = float(pk.get("f_hz", 0.0))
+                    apk = float(pk.get("amp", 0.0))
+                except Exception:
+                    continue
+                if fpk > 0 and abs(fpk - freq) <= tol and apk > best:
+                    best = apk
+            return best if best > 0 else None
+
+        def _nearest_env_amp(freq: float) -> Optional[float]:
+            if not freq or freq <= 0:
+                return None
+            tol = max(0.03 * freq, (df_env or 0.0) * 2.0 or 0.5)
+            best = 0.0
+            for pk in env_peaks:
+                try:
+                    fpk = float(pk.get("f_hz", 0.0))
+                    apk = float(pk.get("amp", 0.0))
+                except Exception:
+                    continue
+                if fpk > 0 and abs(fpk - freq) <= tol and apk > best:
+                    best = apk
+            return best if best > 0 else None
+
+        if _has(["Desbalanceo"]):
+            detail = "Indicadores de desbalanceo: "
+            if dom_freq > 0:
+                detail += f"1X={dom_freq:.2f} Hz ({dom_amp:.2f} mm/s). "
+            if r2x or r3x:
+                detail += f"Relación 2X={r2x:.2f}, 3X={r3x:.2f}. "
+            if frac_low:
+                detail += f"Energía baja {frac_low:.0%}."
+            _append_unique(diag_lines, detail.strip())
+            _append_unique(review_lines, "Revisar balanceo del rotor/acoplamiento, fijaciones y limpieza de rotor.")
+            _append_unique(reco_lines, "Programar balanceo dinámico y verificación de fijaciones tras la corrección.")
+
+        if _has(["Desalineaci", "Desalineación", "Desalineacion"]):
+            detail = (
+                "Armónicos 2X/3X elevados respecto a 1X"
+                f" (2X={r2x:.2f}, 3X={r3x:.2f})."
+            )
+            _append_unique(diag_lines, detail)
+            _append_unique(review_lines, "Inspeccionar alineación de ejes, calces y planitud de la base.")
+            _append_unique(reco_lines, "Realizar alineación láser o dial y confirmar holguras de acoplamiento.")
+
+        if _has(["Engranes", "Engranaje"]):
+            mesh_freq = None
+            for text in findings:
+                if text and "Engran" in text:
+                    m = re.search(r"~([0-9]+(?:\.[0-9]+)?)\s*Hz", text)
+                    if m:
+                        try:
+                            mesh_freq = float(m.group(1))
+                        except Exception:
+                            mesh_freq = None
+                    break
+            mesh_amp = _nearest_fft_amp(mesh_freq) if mesh_freq else None
+            if mesh_freq:
+                msg = f"Componente de engrane alrededor de {mesh_freq:.1f} Hz"
+                if mesh_amp:
+                    msg += f" ({mesh_amp:.3f} mm/s)."
+                else:
+                    msg += "."
+                _append_unique(diag_lines, msg)
+            else:
+                _append_unique(diag_lines, "Componente de engranes destacado en el espectro.")
+            _append_unique(review_lines, "Revisar condición de dientes, juego/backlash y lubricación del tren.")
+            _append_unique(reco_lines, "Programar inspección visual o boroscópica del engranaje y validar lubricación.")
+
+        bearing_tags: List[str] = []
+        for text in findings:
+            if not text:
+                continue
+            bearing_tags.extend(re.findall(r"(BPFO|BPFI|BSF|FTF)", text))
+        bearing_tags = list(dict.fromkeys(bearing_tags))
+        bearing_freqs = res.get("bearing_freqs", {}) or {}
+        if bearing_tags:
+            details: List[str] = []
+            for tag in bearing_tags:
+                freq = bearing_freqs.get(tag.lower())
+                if freq and freq > 0:
+                    amp = _nearest_env_amp(float(freq))
+                    if amp:
+                        details.append(f"{tag} ~{float(freq):.1f} Hz (envolvente {amp:.3f})")
+                    else:
+                        details.append(f"{tag} ~{float(freq):.1f} Hz")
+                else:
+                    details.append(tag)
+            _append_unique(diag_lines, "Indicadores de rodamiento: " + "; ".join(details) + ".")
+            _append_unique(review_lines, "Inspeccionar lubricación, holgura y condición de pistas y elementos rodantes.")
+            _append_unique(reco_lines, "Planificar análisis complementario (aceite/ultrasonido) o reemplazo del rodamiento según criticidad.")
+
+        if _has(["Eléctrico", "Electrico", "El?ctrico", "El\u0019ctrico"]):
+            line_freq = res.get("line_freq_hz")
+            if line_freq and line_freq > 0:
+                detail = f"Componentes eléctricos detectados cerca de {float(line_freq):.1f} Hz y su armónico."
+            else:
+                detail = "Componentes eléctricos alineados con la frecuencia de línea detectados."
+            _append_unique(diag_lines, detail)
+            _append_unique(review_lines, "Verificar balance de fases, conexiones y condición del variador si aplica.")
+            _append_unique(reco_lines, "Medir corriente/voltaje y corregir desequilibrios o armónicos en la alimentación.")
+
+        if _has(["Resonancia"]):
+            res_freq = None
+            res_q = None
+            for text in findings:
+                if text and "Resonancia" in text:
+                    m_f = re.search(r"~([0-9]+(?:\.[0-9]+)?)\s*Hz", text)
+                    m_q = re.search(r"Q~([0-9]+(?:\.[0-9]+)?)", text)
+                    if m_f:
+                        try:
+                            res_freq = float(m_f.group(1))
+                        except Exception:
+                            res_freq = None
+                    if m_q:
+                        try:
+                            res_q = float(m_q.group(1))
+                        except Exception:
+                            res_q = None
+                    break
+            if res_freq:
+                msg = f"Posible resonancia estructural cerca de {res_freq:.1f} Hz"
+                if res_q:
+                    msg += f" (Q≈{res_q:.1f})."
+                else:
+                    msg += "."
+                _append_unique(diag_lines, msg)
+            else:
+                _append_unique(diag_lines, "Comportamiento resonante identificado en el espectro.")
+            _append_unique(review_lines, "Revisar rigidez de soportes, aprietes y realizar prueba modal si es posible.")
+            _append_unique(reco_lines, "Evaluar cambios de rigidez/amortiguamiento o redistribución de masas para alejar la resonancia.")
+
+        if not review_lines:
+            if rms_mm >= 4.5:
+                _append_unique(review_lines, "Revisar historial de vibración y condición mecánica general del tren motriz.")
+            else:
+                _append_unique(review_lines, "Mantener inspecciones rutinarias y validar la medición en el siguiente ciclo.")
+
+        if not reco_lines:
+            if rms_mm >= 7.1:
+                _append_unique(reco_lines, "Recomendar intervención inmediata antes de continuar con operación prolongada.")
+            elif rms_mm >= 4.5:
+                _append_unique(reco_lines, "Programar corrección en el próximo paro planificado y seguir tendencia de vibración.")
+            else:
+                _append_unique(reco_lines, "Continuar con monitoreo periódico para confirmar estabilidad de la condición.")
+
+        if rpm > 0 and f1 == 0:
+            _append_unique(diag_lines, f"RPM estimada {rpm:.0f} (sin sincronización de 1X disponible).")
+
+        return diag_lines, review_lines, reco_lines
 
     def _acc_to_vel_time_mm(self, acc: np.ndarray, t: np.ndarray) -> np.ndarray:
         """
@@ -5944,11 +6151,36 @@ class MainApp:
                 _hide_lf = True
             _fft_filter_note = f"Filtro visual FFT: oculta < {_fc:.2f} Hz" if _hide_lf else "Filtro visual FFT: sin ocultar"
 
-            # Recalcular explicaciones con helper unificado (evita divergencias)
+            # Construir secciones detalladas de diagnóstico
             try:
-                exp_lines = self._build_explanations(res, findings)
+                diag_lines, review_lines, reco_lines = self._build_diagnostic_sections(res, findings)
             except Exception:
-                pass
+                diag_lines, review_lines, reco_lines = [], [], []
+
+            detail_controls: List[ft.Control] = []
+
+            def _add_section(title: str, lines: List[str]):
+                nonlocal detail_controls
+                if not lines:
+                    return
+                if detail_controls:
+                    detail_controls.append(ft.Divider())
+                detail_controls.append(ft.Text(title, size=16, weight="bold"))
+                detail_controls.extend(ft.Text(f"- {line}") for line in lines)
+
+            _add_section("Diagnóstico detallado", diag_lines)
+            _add_section("Revisión sugerida", review_lines)
+            _add_section("Recomendaciones", reco_lines)
+
+            if not detail_controls:
+                detail_controls.append(ft.Text("Sin observaciones adicionales."))
+
+            detail_section = ft.Container(
+                content=ft.Column(detail_controls, spacing=6),
+                bgcolor=ft.Colors.with_opacity(0.05, self._accent_ui()),
+                border_radius=10,
+                padding=10,
+            )
 
             # --- Contenedor con scroll (en Column, no en Container) ---
 
@@ -5960,17 +6192,9 @@ class MainApp:
 
                     controls=[
                         resumen_exec,
-                    ft.Container(
-                        content=ft.Column([
-                            ft.Text("Explicación y revisiones sugeridas", size=16, weight="bold"),
-                            *[ft.Text(f"- {it}") for it in exp_lines],
-                        ], spacing=6),
-                        bgcolor=ft.Colors.with_opacity(0.05, self._accent_ui()),
-                        border_radius=10,
-                        padding=10,
-                    ),
-                    ft.Text(_fft_filter_note),
-                    chart
+                        detail_section,
+                        ft.Text(_fft_filter_note),
+                        chart
                 ]
                     + ([runup_chart] if runup_chart else [])
                     + ([env_chart] if 'env_chart' in locals() and env_chart else [])
