@@ -1695,6 +1695,15 @@ class MainApp:
             stored = None
         return self._sanitize_color(stored, default)
 
+    def _remember_color_pref(self, key: str, selected: Optional[str], fallback: str) -> str:
+        """Normaliza y persiste un color elegido por el usuario."""
+        color = self._sanitize_color(selected, fallback)
+        try:
+            self.page.client_storage.set(key, color)
+        except Exception:
+            pass
+        return color
+
     def _collect_selected_signals(self) -> List[str]:
         try:
             labels = [
@@ -1709,6 +1718,34 @@ class MainApp:
             return list(dict.fromkeys(labels))
         except Exception:
             return labels
+
+    def _refresh_aux_control_state(self):
+        show_aux = not getattr(self, "combine_signals_enabled", False)
+        has_aux = bool(getattr(self, "aux_controls", []))
+        visible = show_aux and has_aux
+        try:
+            for cb, color_dd, style_dd in getattr(self, "aux_controls", []):
+                for ctrl in (cb, color_dd, style_dd):
+                    if not ctrl:
+                        continue
+                    try:
+                        ctrl.disabled = not show_aux
+                        if ctrl.page:
+                            ctrl.update()
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        for ctrl_name in ("aux_controls_title", "aux_controls_column"):
+            ctrl = getattr(self, ctrl_name, None)
+            if ctrl is None:
+                continue
+            try:
+                ctrl.visible = visible
+                if ctrl.page:
+                    ctrl.update()
+            except Exception:
+                continue
 
     def _sync_select_all_checkbox(self):
         try:
@@ -2399,24 +2436,25 @@ class MainApp:
                 img_runup = None
 
             aux_imgs = []
-            aux_selected = []
-            try:
-                aux_selected = [
-                    (cb.label, color_dd.value, style_dd.value)
-                    for cb, color_dd, style_dd in getattr(self, "aux_controls", [])
-                    if getattr(cb, "value", False)
-                ]
-            except Exception:
+            if not getattr(self, "combine_signals_enabled", False):
                 aux_selected = []
-            for col, color, style in aux_selected:
-                if col in self.current_df.columns:
-                    aux_fig, aux_ax = plt.subplots(figsize=(8, 2))
-                    aux_ax.plot(self.current_df[time_col], self.current_df[col], color=color, linestyle=style, linewidth=2, label=col)
-                    aux_ax.set_title(f"{col} vs Tiempo")
-                    aux_ax.legend()
-                    aux_ax.set_xlabel("Tiempo (s)")
-                    aux_ax.set_ylabel(col)
-                    aux_imgs.append(save_plot(aux_fig))
+                try:
+                    aux_selected = [
+                        (cb.label, color_dd.value, style_dd.value)
+                        for cb, color_dd, style_dd in getattr(self, "aux_controls", [])
+                        if getattr(cb, "value", False)
+                    ]
+                except Exception:
+                    aux_selected = []
+                for col, color, style in aux_selected:
+                    if col in self.current_df.columns:
+                        aux_fig, aux_ax = plt.subplots(figsize=(8, 2))
+                        aux_ax.plot(self.current_df[time_col], self.current_df[col], color=color, linestyle=style, linewidth=2, label=col)
+                        aux_ax.set_title(f"{col} vs Tiempo")
+                        aux_ax.legend()
+                        aux_ax.set_xlabel("Tiempo (s)")
+                        aux_ax.set_ylabel(col)
+                        aux_imgs.append(save_plot(aux_fig))
 
             doc = SimpleDocTemplate(pdf_path, pagesize=A4)
             styles = getSampleStyleSheet()
@@ -4098,6 +4136,11 @@ class MainApp:
             on_change=self._on_time_color_change,
         )
 
+        aux_rows = [ft.Row([cb, color_dd, style_dd], spacing=10) for cb, color_dd, style_dd in self.aux_controls]
+        self.aux_controls_column = ft.Column(aux_rows, spacing=5)
+        self.aux_controls_title = ft.Text("📌 Variables auxiliares:", size=14)
+        self._refresh_aux_control_state()
+
         self.fft_color_dd = ft.Dropdown(
             label='Color FFT',
             options=fft_color_options,
@@ -4206,15 +4249,9 @@ class MainApp:
 
                 # Auxiliares
 
-                ft.Text("📌 Variables auxiliares:", size=14),
+                self.aux_controls_title,
 
-                ft.Column([
-
-                    ft.Row([cb, color_dd, style_dd], spacing=10)
-
-                    for cb, color_dd, style_dd in self.aux_controls
-
-                ], spacing=5),
+                self.aux_controls_column,
 
 
 
@@ -5775,38 +5812,40 @@ class MainApp:
 
             # --- Gráficas auxiliares ---
 
-            aux_plots = []
+            aux_plots: List[ft.Control] = []
 
-            for cb, color_dd, style_dd in self.aux_controls:
+            if not getattr(self, "combine_signals_enabled", False):
 
-                if cb.value:
+                for cb, color_dd, style_dd in self.aux_controls:
 
-                    aux_fig, aux_ax = plt.subplots(figsize=(8, 2))
+                    if cb.value:
 
-                    aux_ax.plot(
+                        aux_fig, aux_ax = plt.subplots(figsize=(8, 2))
 
-                        self.current_df[time_col],
+                        aux_ax.plot(
 
-                        self.current_df[cb.label],
+                            self.current_df[time_col],
 
-                        color=color_dd.value,
+                            self.current_df[cb.label],
 
-                        linestyle=style_dd.value,
+                            color=color_dd.value,
 
-                        linewidth=2,
+                            linestyle=style_dd.value,
 
-                        label=cb.label
+                            linewidth=2,
 
-                    )
+                            label=cb.label
 
-                    aux_ax.set_title(f"{cb.label} vs Tiempo")
+                        )
 
-                    aux_ax.legend()
+                        aux_ax.set_title(f"{cb.label} vs Tiempo")
 
-                    aux_fig.tight_layout()
+                        aux_ax.legend()
 
-                    aux_plots.append(MatplotlibChart(aux_fig, expand=True, isolated=True))
-                    plt.close(aux_fig)
+                        aux_fig.tight_layout()
+
+                        aux_plots.append(MatplotlibChart(aux_fig, expand=True, isolated=True))
+                        plt.close(aux_fig)
 
             # --- Resumen Ejecutivo (mm/s, formal al inicio) ---
             try:
@@ -7210,6 +7249,7 @@ class MainApp:
             self.page.client_storage.set("combine_signals_enabled", self.combine_signals_enabled)
         except Exception:
             pass
+        self._refresh_aux_control_state()
         self._update_analysis()
         try:
             self._update_multi_chart()
