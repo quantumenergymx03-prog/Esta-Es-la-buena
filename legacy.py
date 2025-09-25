@@ -3,6 +3,7 @@ import asyncio
 import time
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
 from flet.matplotlib_chart import MatplotlibChart
 import numpy as np
 from datetime import datetime
@@ -791,6 +792,7 @@ class MainApp:
         self.combine_signals_enabled = self._get_bool_storage("combine_signals_enabled", False)
         self._last_combined_sources: List[str] = []
         self._current_signal_label: Optional[str] = None
+        self._last_runup_warning: Optional[str] = None
 
 
 
@@ -2413,6 +2415,7 @@ class MainApp:
                 img_env = None
 
             img_runup = None
+            img_runup_reason = None
             try:
                 runup_enabled = False
                 if getattr(self, 'runup_3d_cb', None):
@@ -2421,7 +2424,7 @@ class MainApp:
                     runup_enabled = bool(getattr(self, 'runup_3d_enabled', False))
                 if runup_enabled:
                     zoom_tuple = (zmin, zmax) if zmin is not None else None
-                    runup_fig = self._generate_runup_3d_figure(
+                    runup_fig, img_runup_reason = self._generate_runup_3d_figure(
                         t_seg,
                         sig_seg,
                         fc,
@@ -2432,8 +2435,13 @@ class MainApp:
                     )
                     if runup_fig is not None:
                         img_runup = save_plot(runup_fig)
+                    elif img_runup_reason:
+                        self._last_runup_warning = img_runup_reason
+                else:
+                    self._last_runup_warning = None
             except Exception:
                 img_runup = None
+                img_runup_reason = None
 
             aux_imgs = []
             if not getattr(self, "combine_signals_enabled", False):
@@ -2621,6 +2629,9 @@ class MainApp:
             if img_runup:
                 elements.append(Paragraph("Arranque/Paro - Cascada 3D", styles['Heading2']))
                 elements.append(Image(img_runup, width=400, height=180))
+            elif img_runup_reason:
+                elements.append(Paragraph("Arranque/Paro - Cascada 3D", styles['Heading2']))
+                elements.append(Paragraph(f"⚠️ {img_runup_reason}", styles['Normal']))
 
             if aux_imgs:
                 elements.append(Paragraph("Variables auxiliares", styles['Heading2']))
@@ -4599,24 +4610,24 @@ class MainApp:
         fmax_ui: Optional[float],
         zoom_range: Optional[Tuple[float, float]],
         dark_mode: bool,
-    ):
+    ) -> Tuple[Optional[Figure], Optional[str]]:
         try:
             t = np.asarray(t_segment, dtype=float).ravel()
             y = np.asarray(signal_segment, dtype=float).ravel()
-            if t.size < 256 or y.size != t.size:
-                return None
+            if t.size < 64 or y.size != t.size:
+                return None, "Se requieren al menos 64 muestras sincronizadas para la cascada 3D."
             dt = float(np.median(np.diff(t)))
             if not (np.isfinite(dt) and dt > 0):
-                return None
+                return None, "No se pudo estimar el intervalo de muestreo de la señal combinada."
             n = y.size
-            approx = min(n, 2048)
-            if approx < 128:
-                return None
-            power = int(np.floor(np.log2(max(128, approx))))
+            approx = min(n, 4096)
+            if approx < 64:
+                return None, "La ventana disponible es demasiado corta para la cascada 3D."
+            power = int(np.floor(np.log2(max(64, approx))))
             nfft = int(2 ** power)
             nfft = min(nfft, n)
-            if nfft < 128:
-                return None
+            if nfft < 64:
+                return None, "La señal combinada no tiene suficientes muestras consecutivas para el análisis 3D."
             window = np.hanning(nfft)
             step = max(1, int(nfft * 0.25))
             if step >= nfft:
@@ -4639,7 +4650,7 @@ class MainApp:
                 seg_t = t[start:start + nfft]
                 times.append(float(np.mean(seg_t)))
             if not spectra or freq_axis is None:
-                return None
+                return None, "No se encontraron ventanas válidas para graficar la cascada 3D."
             spec_arr = np.vstack(spectra)
             times_arr = np.asarray(times, dtype=float)
             freq_mask = np.ones_like(freq_axis, dtype=bool)
@@ -4650,11 +4661,11 @@ class MainApp:
             if zoom_range and zoom_range[1] > zoom_range[0]:
                 freq_mask &= (freq_axis >= zoom_range[0]) & (freq_axis <= zoom_range[1])
             if not np.any(freq_mask):
-                freq_mask = np.ones_like(freq_axis, dtype=bool)
+                return None, "El rango de frecuencias seleccionado no deja puntos para la cascada 3D."
             freq_sel = freq_axis[freq_mask]
             amp = spec_arr[:, freq_mask].T  # freq x time
             if freq_sel.size == 0 or amp.size == 0:
-                return None
+                return None, "La cascada 3D quedó vacía tras aplicar los filtros de frecuencia."
             fig = plt.figure(figsize=(10, 6))
             face = "#0f141b" if dark_mode else "white"
             fig.patch.set_facecolor(face)
@@ -4683,9 +4694,9 @@ class MainApp:
                     tick.set_color(axis_color)
             fig.colorbar(surf, ax=ax, shrink=0.6, pad=0.1, label="Velocidad [mm/s]")
             fig.tight_layout()
-            return fig
-        except Exception:
-            return None
+            return fig, None
+        except Exception as exc:
+            return None, f"No se pudo generar la cascada 3D: {exc}"
 
     def _format_fft_zoom_label(self, start: float, end: float, full_range: Tuple[float, float]) -> str:
         min_val, max_val = full_range
@@ -5792,9 +5803,10 @@ class MainApp:
 
             runup_chart = None
             try:
+                runup_msg = None
                 if getattr(self, 'runup_3d_cb', None) and getattr(self.runup_3d_cb, 'value', False):
                     zoom_tuple = (zmin, zmax) if zmin is not None else None
-                    runup_fig = self._generate_runup_3d_figure(
+                    runup_fig, runup_msg = self._generate_runup_3d_figure(
                         t_segment,
                         signal_segment,
                         fc,
@@ -5806,7 +5818,14 @@ class MainApp:
                     if runup_fig is not None:
                         runup_chart = MatplotlibChart(runup_fig, expand=True, isolated=True)
                         plt.close(runup_fig)
+                    elif runup_msg:
+                        runup_chart = ft.Text(f"⚠️ {runup_msg}")
+                if runup_msg:
+                    self._last_runup_warning = runup_msg
+                else:
+                    self._last_runup_warning = None
             except Exception:
+                self._last_runup_warning = None
                 runup_chart = None
 
 
@@ -5902,6 +5921,8 @@ class MainApp:
                 ft.Text("🩺 Diagnóstico automático (baseline)", size=16, weight="bold"),
                 *[ft.Text(f"• {it}") for it in findings],
             ])
+            if getattr(self, "_last_runup_warning", None):
+                summary_items.append(ft.Text(f"⚠️ Cascada 3D: {self._last_runup_warning}"))
 
             resumen = ft.Container(
                 content=ft.Column(summary_items, spacing=6),
