@@ -3,6 +3,7 @@ import asyncio
 import time
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
 from flet.matplotlib_chart import MatplotlibChart
 import numpy as np
 from datetime import datetime
@@ -16,6 +17,7 @@ mpl.rcParams["svg.fonttype"] = "none"
 mpl.rcParams["axes.unicode_minus"] = False
 import os
 import colorsys
+import re
 from typing import Optional, Tuple, Dict, Any, List
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  # Needed for 3D projections
 # --- PDF reportlab imports ---
@@ -625,6 +627,14 @@ def analyze_vibration(
         "f1_hz": f1,
         "severity": {"label": sev_label, "color": sev_color, "rms_mm_s": rms_vel_spec_mm},
         "diagnosis": findings,
+        "line_freq_hz": line_freq_hz,
+        "gear_teeth": gear_teeth,
+        "bearing_freqs": {
+            "bpfo": bpfo_hz,
+            "bpfi": bpfi_hz,
+            "bsf": bsf_hz,
+            "ftf": ftf_hz,
+        },
     }
 
 
@@ -790,6 +800,8 @@ class MainApp:
         self.fft_plot_color = self._get_color_pref("fft_plot_color", self._accent_ui())
         self.combine_signals_enabled = self._get_bool_storage("combine_signals_enabled", False)
         self._last_combined_sources: List[str] = []
+        self._current_signal_label: Optional[str] = None
+        self._last_runup_warning: Optional[str] = None
 
 
 
@@ -1694,15 +1706,119 @@ class MainApp:
             stored = None
         return self._sanitize_color(stored, default)
 
+    def _remember_color_pref(self, key: str, selected: Optional[str], fallback: str) -> str:
+        """Normaliza y persiste un color elegido por el usuario."""
+        color = self._sanitize_color(selected, fallback)
+        try:
+            self.page.client_storage.set(key, color)
+        except Exception:
+            pass
+        return color
+
     def _collect_selected_signals(self) -> List[str]:
         try:
-            return [
+            labels = [
                 cb.label
                 for cb in getattr(self, "signal_checkboxes", [])
                 if getattr(cb, "value", False)
             ]
         except Exception:
-            return []
+            labels = []
+        # Eliminar duplicados conservando el orden
+        try:
+            return list(dict.fromkeys(labels))
+        except Exception:
+            return labels
+
+    def _refresh_aux_control_state(self):
+        show_aux = not getattr(self, "combine_signals_enabled", False)
+        has_aux = bool(getattr(self, "aux_controls", []))
+        visible = show_aux and has_aux
+        try:
+            for cb, color_dd, style_dd in getattr(self, "aux_controls", []):
+                for ctrl in (cb, color_dd, style_dd):
+                    if not ctrl:
+                        continue
+                    try:
+                        ctrl.disabled = not show_aux
+                        if ctrl.page:
+                            ctrl.update()
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        for ctrl_name in ("aux_controls_title", "aux_controls_column"):
+            ctrl = getattr(self, ctrl_name, None)
+            if ctrl is None:
+                continue
+            try:
+                ctrl.visible = visible
+                if ctrl.page:
+                    ctrl.update()
+            except Exception:
+                continue
+
+    def _sync_select_all_checkbox(self):
+        try:
+            select_all_cb = getattr(self, "signal_select_all_cb", None)
+            checkboxes = getattr(self, "signal_checkboxes", [])
+        except Exception:
+            return
+        if not select_all_cb:
+            return
+        try:
+            values = [bool(getattr(cb, "value", False)) for cb in checkboxes]
+            if not values:
+                new_value = False
+            elif all(values):
+                new_value = True
+            elif any(values):
+                new_value = None
+            else:
+                new_value = False
+            if select_all_cb.value != new_value:
+                select_all_cb.value = new_value
+                if select_all_cb.page:
+                    select_all_cb.update()
+        except Exception:
+            pass
+
+    def _on_select_all_signals(self, e=None):
+        try:
+            desired = bool(getattr(self.signal_select_all_cb, "value", False))
+        except Exception:
+            desired = False
+        updated = False
+        try:
+            for cb in getattr(self, "signal_checkboxes", []):
+                if getattr(cb, "value", False) != desired:
+                    cb.value = desired
+                    updated = True
+                    if cb.page:
+                        cb.update()
+        except Exception:
+            pass
+        if updated:
+            try:
+                self._update_multi_chart()
+            except Exception:
+                pass
+            try:
+                self._update_analysis()
+            except Exception:
+                pass
+        self._sync_select_all_checkbox()
+
+    def _on_signal_checkbox_change(self, e=None):
+        self._sync_select_all_checkbox()
+        try:
+            self._update_multi_chart()
+        except Exception:
+            pass
+        try:
+            self._update_analysis()
+        except Exception:
+            pass
 
     def _build_combined_signal(self, columns: List[str]) -> Optional[np.ndarray]:
         try:
@@ -1710,11 +1826,83 @@ class MainApp:
                 return None
             data = self.current_df[columns].apply(pd.to_numeric, errors="coerce")
             arr = np.nan_to_num(data.to_numpy(dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
-            if arr.ndim != 2 or arr.shape[1] < 2:
+            if arr.ndim == 1:
+                arr = arr.reshape(-1, 1)
+            if arr.shape[1] == 0:
                 return None
+            if arr.shape[1] == 1:
+                # Si solo hay una columna útil, devolverla tal cual para mantener compatibilidad.
+                return arr[:, 0]
             return np.sqrt(np.sum(np.square(arr), axis=1))
         except Exception:
             return None
+
+    def _get_time_signal_data(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[str]]:
+        """
+        Obtiene la columna de tiempo y la señal principal considerando la opción de
+        combinar señales seleccionadas mediante RMS vectorial.
+        Devuelve: (tiempo, señal, etiqueta_para_graficas)
+        """
+        if self.current_df is None or getattr(self.current_df, "empty", True):
+            return None, None, None
+
+        time_col = getattr(self.time_dropdown, "value", None)
+        signal_col = getattr(self.fft_dropdown, "value", None)
+        if not time_col or not signal_col:
+            return None, None, None
+        if time_col not in self.current_df.columns or signal_col not in self.current_df.columns:
+            return None, None, None
+
+        time_series = pd.to_numeric(self.current_df[time_col], errors="coerce")
+        signal_series = pd.to_numeric(self.current_df[signal_col], errors="coerce")
+        t = time_series.to_numpy(dtype=float)
+        signal = np.nan_to_num(signal_series.to_numpy(dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+
+        combined_label = signal_col
+        combined_sources: List[str] = []
+
+        if getattr(self, "combine_signals_enabled", False):
+            selected_cols = self._collect_selected_signals()
+            if not selected_cols:
+                try:
+                    numeric_cols = self.current_df.select_dtypes(include=[np.number]).columns.tolist()
+                except Exception:
+                    numeric_cols = []
+                selected_cols = [col for col in numeric_cols if col != time_col]
+            if signal_col not in selected_cols and signal_col != time_col:
+                selected_cols.append(signal_col)
+            valid_cols = [col for col in selected_cols if col in self.current_df.columns and col != time_col]
+            # Eliminar duplicados preservando orden
+            valid_cols = list(dict.fromkeys(valid_cols))
+
+            combined = None
+            if len(valid_cols) >= 2:
+                combined = self._build_combined_signal(valid_cols)
+            elif len(valid_cols) == 1:
+                combined = self._build_combined_signal(valid_cols)
+            if combined is not None and combined.shape[0] == signal.shape[0]:
+                signal = combined
+                combined_sources = valid_cols
+                if len(valid_cols) >= 2:
+                    combined_label = f"RMS({', '.join(valid_cols)})"
+                else:
+                    combined_label = valid_cols[0]
+
+        prev_sources = getattr(self, "_last_combined_sources", [])
+        if combined_sources != prev_sources:
+            self._last_combined_sources = combined_sources
+            try:
+                if combined_sources:
+                    self._log(
+                        "Señal principal combinada mediante RMS vectorial: "
+                        + ", ".join(combined_sources)
+                    )
+                elif prev_sources:
+                    self._log("Se utiliza una única columna como señal principal.")
+            except Exception:
+                pass
+
+        return t, signal, combined_label
 
     # Helpers de lectura segura de campos
     def _fldf(self, fld):
@@ -1856,8 +2044,14 @@ class MainApp:
             plt.style.use("seaborn-v0_8-whitegrid")
             plt.rcParams["font.family"] = "DejaVu Sans"
 
-            t = self.current_df[time_col].to_numpy()
-            signal = self.current_df[fft_signal_col].to_numpy()
+            data_tuple = self._get_time_signal_data()
+            if not data_tuple or data_tuple[0] is None or data_tuple[1] is None:
+                self._log("No se pudo obtener la señal principal para exportar.")
+                return
+
+            t, signal, signal_label = data_tuple
+            if signal_label is None:
+                signal_label = fft_signal_col
 
             try:
                 start_t = float(self.start_time_field.value) if getattr(self.start_time_field, "value", None) else t[0]
@@ -2012,27 +2206,29 @@ class MainApp:
                 return path
 
             fig1, ax1 = plt.subplots(figsize=(8, 3))
-            if len(t_seg) > 0:
-                ax1.plot(t_seg, sig_seg, color=self.time_plot_color)
-            ax1.set_title(f"Señal {fft_signal_col} ({start_t:.2f}-{end_t:.2f}s)")
+            try:
+                unit_mode = getattr(self, "time_unit_dd", None).value if getattr(self, "time_unit_dd", None) else "vel_mm"
+            except Exception:
+                unit_mode = "vel_mm"
+            if unit_mode == "vel_mm":
+                y_time = self._acc_to_vel_time_mm(sig_seg, t_seg)
+                y_label = "Velocidad [mm/s]"
+                rms_text = f"RMS vel: {self._calculate_rms(y_time):.3f} mm/s" if y_time.size else "RMS vel: 0.000 mm/s"
+            elif unit_mode == "acc_g":
+                y_time = sig_seg / 9.80665
+                y_label = "Aceleración [g]"
+                rms_text = f"RMS acc: {self._calculate_rms(y_time):.3f} g"
+            else:
+                y_time = sig_seg
+                y_label = "Aceleración [m/s²]"
+                rms_text = f"RMS acc: {self._calculate_rms(y_time):.3e} m/s²"
+            if y_time.size:
+                ax1.plot(t_seg, y_time, color=self.time_plot_color)
+            ax1.set_title(f"Señal {signal_label} ({start_t:.2f}-{end_t:.2f}s)")
             ax1.set_xlabel("Tiempo (s)")
-            ax1.set_ylabel("Aceleración [m/s²]")
+            ax1.set_ylabel(y_label)
             try:
-                rms_acc = self._calculate_rms(sig_seg)
-                ax1.text(0.02, 0.95, f"RMS acc: {rms_acc:.3e} m/s²", transform=ax1.transAxes, va="top")
-            except Exception:
-                pass
-
-            # Ajustar etiqueta de eje Y segun unidad seleccionada
-            try:
-                ax1.set_ylabel(_ylabel)
-            except Exception:
-                pass
-
-            # Anotar RMS conforme a la unidad seleccionada
-            try:
-                text_color = "white" if self.is_dark_mode else "black"
-                ax1.text(0.02, 0.95, _rms_text, transform=ax1.transAxes, va="top", color=text_color)
+                ax1.text(0.02, 0.95, rms_text, transform=ax1.transAxes, va="top", color="black")
             except Exception:
                 pass
             img_time = save_plot(fig1)
@@ -2228,6 +2424,7 @@ class MainApp:
                 img_env = None
 
             img_runup = None
+            img_runup_reason = None
             try:
                 runup_enabled = False
                 if getattr(self, 'runup_3d_cb', None):
@@ -2236,7 +2433,7 @@ class MainApp:
                     runup_enabled = bool(getattr(self, 'runup_3d_enabled', False))
                 if runup_enabled:
                     zoom_tuple = (zmin, zmax) if zmin is not None else None
-                    runup_fig = self._generate_runup_3d_figure(
+                    runup_fig, img_runup_reason = self._generate_runup_3d_figure(
                         t_seg,
                         sig_seg,
                         fc,
@@ -2247,28 +2444,34 @@ class MainApp:
                     )
                     if runup_fig is not None:
                         img_runup = save_plot(runup_fig)
+                    elif img_runup_reason:
+                        self._last_runup_warning = img_runup_reason
+                else:
+                    self._last_runup_warning = None
             except Exception:
                 img_runup = None
+                img_runup_reason = None
 
             aux_imgs = []
-            aux_selected = []
-            try:
-                aux_selected = [
-                    (cb.label, color_dd.value, style_dd.value)
-                    for cb, color_dd, style_dd in getattr(self, "aux_controls", [])
-                    if getattr(cb, "value", False)
-                ]
-            except Exception:
+            if not getattr(self, "combine_signals_enabled", False):
                 aux_selected = []
-            for col, color, style in aux_selected:
-                if col in self.current_df.columns:
-                    aux_fig, aux_ax = plt.subplots(figsize=(8, 2))
-                    aux_ax.plot(self.current_df[time_col], self.current_df[col], color=color, linestyle=style, linewidth=2, label=col)
-                    aux_ax.set_title(f"{col} vs Tiempo")
-                    aux_ax.legend()
-                    aux_ax.set_xlabel("Tiempo (s)")
-                    aux_ax.set_ylabel(col)
-                    aux_imgs.append(save_plot(aux_fig))
+                try:
+                    aux_selected = [
+                        (cb.label, color_dd.value, style_dd.value)
+                        for cb, color_dd, style_dd in getattr(self, "aux_controls", [])
+                        if getattr(cb, "value", False)
+                    ]
+                except Exception:
+                    aux_selected = []
+                for col, color, style in aux_selected:
+                    if col in self.current_df.columns:
+                        aux_fig, aux_ax = plt.subplots(figsize=(8, 2))
+                        aux_ax.plot(self.current_df[time_col], self.current_df[col], color=color, linestyle=style, linewidth=2, label=col)
+                        aux_ax.set_title(f"{col} vs Tiempo")
+                        aux_ax.legend()
+                        aux_ax.set_xlabel("Tiempo (s)")
+                        aux_ax.set_ylabel(col)
+                        aux_imgs.append(save_plot(aux_fig))
 
             doc = SimpleDocTemplate(pdf_path, pagesize=A4)
             styles = getSampleStyleSheet()
@@ -2382,14 +2585,23 @@ class MainApp:
             for item in []:
                 elements.append(Paragraph(f"- {item}", styles['Normal']))
 
-            # Explicacion y recomendaciones (PDF)
-            # Explicación y recomendaciones (unificadas con la app)
-            exp_lines_pdf2 = self._build_explanations(res, exec_findings)
-            elements.append(Paragraph("Explicacion y recomendaciones", styles['Heading2']))
-            for line in exp_lines_pdf2:
-                elements.append(Paragraph(f"- {line}", styles['Normal']))
-
-            
+            # Diagnóstico, revisión y recomendaciones detalladas
+            diag_pdf, review_pdf, reco_pdf = self._build_diagnostic_sections(res, exec_findings)
+            if diag_pdf:
+                elements.append(Paragraph("Diagnóstico detallado", styles['Heading2']))
+                for line in diag_pdf:
+                    elements.append(Paragraph(f"- {line}", styles['Normal']))
+                elements.append(Spacer(1, 6))
+            if review_pdf:
+                elements.append(Paragraph("Revisión sugerida", styles['Heading2']))
+                for line in review_pdf:
+                    elements.append(Paragraph(f"- {line}", styles['Normal']))
+                elements.append(Spacer(1, 6))
+            if reco_pdf:
+                elements.append(Paragraph("Recomendaciones", styles['Heading2']))
+                for line in reco_pdf:
+                    elements.append(Paragraph(f"- {line}", styles['Normal']))
+                elements.append(Spacer(1, 12))
 
             elements.append(Paragraph("Reporte de Análisis de Vibraciones", title_style))
             elements.append(Paragraph(f"Archivo: {base_name}", styles['Normal']))
@@ -2435,6 +2647,9 @@ class MainApp:
             if img_runup:
                 elements.append(Paragraph("Arranque/Paro - Cascada 3D", styles['Heading2']))
                 elements.append(Image(img_runup, width=400, height=180))
+            elif img_runup_reason:
+                elements.append(Paragraph("Arranque/Paro - Cascada 3D", styles['Heading2']))
+                elements.append(Paragraph(f"⚠️ {img_runup_reason}", styles['Normal']))
 
             if aux_imgs:
                 elements.append(Paragraph("Variables auxiliares", styles['Heading2']))
@@ -3321,9 +3536,15 @@ class MainApp:
 
             fft_signal_col = self.fft_dropdown.value
 
-            t = self.current_df[time_col].to_numpy()
+            data_tuple = self._get_time_signal_data()
+            if not data_tuple or data_tuple[0] is None or data_tuple[1] is None:
+                self._log("No se pudo obtener la señal principal para exportar.")
+                return
 
-            signal = self.current_df[fft_signal_col].to_numpy()
+            t, signal, signal_label = data_tuple
+
+            if signal_label is None:
+                signal_label = fft_signal_col
 
 
 
@@ -3401,15 +3622,29 @@ class MainApp:
 
             # Señal principal
             fig1, ax1 = plt.subplots(figsize=(8, 3))
-            if len(t_seg) > 0:
-                ax1.plot(t_seg, sig_seg, color=self.time_plot_color)
-            ax1.set_title(f"Señal {fft_signal_col} ({start_t:.2f}-{end_t:.2f}s)")
-            ax1.set_xlabel("Tiempo (s)")
-            ax1.set_ylabel("Aceleración [m/s²]")
-            # Anotar RMS aceleración
             try:
-                rms_acc = self._calculate_rms(sig_seg)
-                ax1.text(0.02, 0.95, f"RMS acc: {rms_acc:.3e} m/s²", transform=ax1.transAxes, va="top")
+                unit_mode = getattr(self, "time_unit_dd", None).value if getattr(self, "time_unit_dd", None) else "vel_mm"
+            except Exception:
+                unit_mode = "vel_mm"
+            if unit_mode == "vel_mm":
+                y_time = self._acc_to_vel_time_mm(sig_seg, t_seg)
+                y_label = "Velocidad [mm/s]"
+                rms_text = f"RMS vel: {self._calculate_rms(y_time):.3f} mm/s" if y_time.size else "RMS vel: 0.000 mm/s"
+            elif unit_mode == "acc_g":
+                y_time = sig_seg / 9.80665
+                y_label = "Aceleración [g]"
+                rms_text = f"RMS acc: {self._calculate_rms(y_time):.3f} g"
+            else:
+                y_time = sig_seg
+                y_label = "Aceleración [m/s²]"
+                rms_text = f"RMS acc: {self._calculate_rms(y_time):.3e} m/s²"
+            if y_time.size:
+                ax1.plot(t_seg, y_time, color=self.time_plot_color)
+            ax1.set_title(f"Señal {signal_label} ({start_t:.2f}-{end_t:.2f}s)")
+            ax1.set_xlabel("Tiempo (s)")
+            ax1.set_ylabel(y_label)
+            try:
+                ax1.text(0.02, 0.95, rms_text, transform=ax1.transAxes, va="top", color="black")
             except Exception:
                 pass
             img_time = save_plot(fig1)
@@ -3812,9 +4047,18 @@ class MainApp:
 
         # Señales de tiempo
 
+        self.signal_select_all_cb = ft.Checkbox(
+            label="Seleccionar todas las señales",
+            value=True,
+            tristate=True,
+            on_change=self._on_select_all_signals,
+        )
+
+        default_checked = bool(getattr(self.signal_select_all_cb, "value", True))
+
         self.signal_checkboxes = [
 
-            ft.Checkbox(label=col, value=(col.startswith("a")))
+            ft.Checkbox(label=col, value=default_checked)
 
             for col in numeric_cols if col != initial_time_col
 
@@ -3854,7 +4098,9 @@ class MainApp:
 
         for cb in self.signal_checkboxes:
 
-            cb.on_change = self._update_multi_chart
+            cb.on_change = self._on_signal_checkbox_change
+
+        self._sync_select_all_checkbox()
 
 
 
@@ -3918,6 +4164,11 @@ class MainApp:
             width=200,
             on_change=self._on_time_color_change,
         )
+
+        aux_rows = [ft.Row([cb, color_dd, style_dd], spacing=10) for cb, color_dd, style_dd in self.aux_controls]
+        self.aux_controls_column = ft.Column(aux_rows, spacing=5)
+        self.aux_controls_title = ft.Text("📌 Variables auxiliares:", size=14)
+        self._refresh_aux_control_state()
 
         self.fft_color_dd = ft.Dropdown(
             label='Color FFT',
@@ -4017,6 +4268,8 @@ class MainApp:
 
                 ft.Text("📊 Señales en tiempo:", size=14),
 
+                ft.Row([self.signal_select_all_cb], spacing=10),
+
                 ft.Row(self.signal_checkboxes, wrap=True, spacing=10),
                 self.combine_signals_cb,
 
@@ -4025,15 +4278,9 @@ class MainApp:
 
                 # Auxiliares
 
-                ft.Text("📌 Variables auxiliares:", size=14),
+                self.aux_controls_title,
 
-                ft.Column([
-
-                    ft.Row([cb, color_dd, style_dd], spacing=10)
-
-                    for cb, color_dd, style_dd in self.aux_controls
-
-                ], spacing=5),
+                self.aux_controls_column,
 
 
 
@@ -4381,24 +4628,24 @@ class MainApp:
         fmax_ui: Optional[float],
         zoom_range: Optional[Tuple[float, float]],
         dark_mode: bool,
-    ):
+    ) -> Tuple[Optional[Figure], Optional[str]]:
         try:
             t = np.asarray(t_segment, dtype=float).ravel()
             y = np.asarray(signal_segment, dtype=float).ravel()
-            if t.size < 256 or y.size != t.size:
-                return None
+            if t.size < 64 or y.size != t.size:
+                return None, "Se requieren al menos 64 muestras sincronizadas para la cascada 3D."
             dt = float(np.median(np.diff(t)))
             if not (np.isfinite(dt) and dt > 0):
-                return None
+                return None, "No se pudo estimar el intervalo de muestreo de la señal combinada."
             n = y.size
-            approx = min(n, 2048)
-            if approx < 128:
-                return None
-            power = int(np.floor(np.log2(max(128, approx))))
+            approx = min(n, 4096)
+            if approx < 64:
+                return None, "La ventana disponible es demasiado corta para la cascada 3D."
+            power = int(np.floor(np.log2(max(64, approx))))
             nfft = int(2 ** power)
             nfft = min(nfft, n)
-            if nfft < 128:
-                return None
+            if nfft < 64:
+                return None, "La señal combinada no tiene suficientes muestras consecutivas para el análisis 3D."
             window = np.hanning(nfft)
             step = max(1, int(nfft * 0.25))
             if step >= nfft:
@@ -4421,7 +4668,7 @@ class MainApp:
                 seg_t = t[start:start + nfft]
                 times.append(float(np.mean(seg_t)))
             if not spectra or freq_axis is None:
-                return None
+                return None, "No se encontraron ventanas válidas para graficar la cascada 3D."
             spec_arr = np.vstack(spectra)
             times_arr = np.asarray(times, dtype=float)
             freq_mask = np.ones_like(freq_axis, dtype=bool)
@@ -4432,11 +4679,11 @@ class MainApp:
             if zoom_range and zoom_range[1] > zoom_range[0]:
                 freq_mask &= (freq_axis >= zoom_range[0]) & (freq_axis <= zoom_range[1])
             if not np.any(freq_mask):
-                freq_mask = np.ones_like(freq_axis, dtype=bool)
+                return None, "El rango de frecuencias seleccionado no deja puntos para la cascada 3D."
             freq_sel = freq_axis[freq_mask]
             amp = spec_arr[:, freq_mask].T  # freq x time
             if freq_sel.size == 0 or amp.size == 0:
-                return None
+                return None, "La cascada 3D quedó vacía tras aplicar los filtros de frecuencia."
             fig = plt.figure(figsize=(10, 6))
             face = "#0f141b" if dark_mode else "white"
             fig.patch.set_facecolor(face)
@@ -4465,9 +4712,9 @@ class MainApp:
                     tick.set_color(axis_color)
             fig.colorbar(surf, ax=ax, shrink=0.6, pad=0.1, label="Velocidad [mm/s]")
             fig.tight_layout()
-            return fig
-        except Exception:
-            return None
+            return fig, None
+        except Exception as exc:
+            return None, f"No se pudo generar la cascada 3D: {exc}"
 
     def _format_fft_zoom_label(self, start: float, end: float, full_range: Tuple[float, float]) -> str:
         min_val, max_val = full_range
@@ -4584,86 +4831,275 @@ class MainApp:
                     break
         return selected
 
-    def _build_explanations(self, res: Dict[str, Any], findings: List[str]) -> List[str]:
-        """
-        Genera una lista de líneas de "Explicación y recomendaciones" basadas en:
-        - Resultado unificado del analizador `res` (rms, severidad, energía por bandas).
-        - Hallazgos principales seleccionados (findings) para orientar motivos y revisiones.
-        """
-        lines: List[str] = []
+    def _build_diagnostic_sections(
+        self,
+        res: Dict[str, Any],
+        findings: Optional[List[str]],
+    ) -> Tuple[List[str], List[str], List[str]]:
+        """Genera listas estructuradas para diagnóstico, revisión y recomendaciones."""
+
+        diag_lines: List[str] = []
+        review_lines: List[str] = []
+        reco_lines: List[str] = []
+
+        def _append_unique(store: List[str], text: Optional[str]) -> None:
+            if text:
+                text = text.strip()
+                if text and text not in store:
+                    store.append(text)
+
+        findings = findings or []
+
         try:
-            sev = res.get('severity', {})
-            rms_mm = float(sev.get('rms_mm_s', 0.0))
-            sev_label = str(sev.get('label', 'N/D'))
+            sev = res.get("severity", {})
+            rms_mm = float(sev.get("rms_mm_s", 0.0))
+            sev_label = str(sev.get("label", "N/D"))
         except Exception:
             rms_mm = 0.0
-            sev_label = 'N/D'
+            sev_label = "N/D"
 
-        # Enfoque
-        lines.append("Enfoque: motor eléctrico")
-
-        # Severidad
+        fft = res.get("fft", {}) or {}
         try:
-            lines.append(f"Severidad por RMS de velocidad (ISO): {rms_mm:.3f} mm/s -> {sev_label}.")
+            dom_freq = float(fft.get("dom_freq_hz") or 0.0)
         except Exception:
-            pass
-
-        # Energía por bandas
+            dom_freq = 0.0
         try:
-            en = res.get('fft', {}).get('energy', {})
-            e_total = float(en.get('total', 1e-12))
-            fl = float(en.get('low', 0.0)) / e_total if e_total > 0 else 0.0
-            fm = float(en.get('mid', 0.0)) / e_total if e_total > 0 else 0.0
-            fh = float(en.get('high', 0.0)) / e_total if e_total > 0 else 0.0
-            lines.append(f"Distribución de energía: baja {fl:.0%}, media {fm:.0%}, alta {fh:.0%}.")
+            dom_amp = float(fft.get("dom_amp_mm_s") or 0.0)
         except Exception:
-            pass
+            dom_amp = 0.0
+        try:
+            r2x = float(fft.get("r2x") or 0.0)
+        except Exception:
+            r2x = 0.0
+        try:
+            r3x = float(fft.get("r3x") or 0.0)
+        except Exception:
+            r3x = 0.0
+        try:
+            f1 = float(res.get("f1_hz") or 0.0)
+        except Exception:
+            f1 = 0.0
+        try:
+            rpm = float(res.get("rpm") or 0.0)
+        except Exception:
+            rpm = 0.0
 
-        # Helper para buscar presencia robusta (variantes de acentos/codificación)
-        def _has_any(keys: List[str]) -> bool:
-            for f in (findings or []):
+        if rms_mm > 0:
+            _append_unique(diag_lines, f"RMS de velocidad {rms_mm:.3f} mm/s → {sev_label}.")
+        if dom_freq > 0 and dom_amp > 0:
+            base_line = f"Frecuencia dominante {dom_freq:.2f} Hz ({dom_amp:.2f} mm/s)."
+            if f1 > 0:
+                base_line += f" 1X estimada {f1:.2f} Hz ({f1 * 60.0:.0f} RPM)."
+            _append_unique(diag_lines, base_line)
+
+        try:
+            energy = fft.get("energy", {}) or {}
+            e_total = float(energy.get("total", 0.0))
+            if e_total > 0:
+                frac_low = float(energy.get("low", 0.0)) / e_total
+                frac_mid = float(energy.get("mid", 0.0)) / e_total
+                frac_high = float(energy.get("high", 0.0)) / e_total
+
+                def _fmt_pct(val: float) -> str:
+                    try:
+                        return f"{max(0.0, min(1.0, val)):.0%}"
+                    except Exception:
+                        return "0%"
+
+                _append_unique(
+                    diag_lines,
+                    "Distribución energética: "
+                    f"baja {_fmt_pct(frac_low)}, media {_fmt_pct(frac_mid)}, alta {_fmt_pct(frac_high)}.",
+                )
+            else:
+                frac_low = frac_mid = frac_high = 0.0
+        except Exception:
+            frac_low = frac_mid = frac_high = 0.0
+
+        def _has(keys: List[str]) -> bool:
+            for key in keys:
                 try:
-                    s = str(f)
+                    if any(key in (f or "") for f in findings):
+                        return True
                 except Exception:
                     continue
-                for k in keys:
-                    if k in s:
-                        return True
             return False
 
-        # Recomendaciones por patrón
-        if _has_any(["Desbalanceo"]):
-            lines += [
-                "Motivo: 1X dominante con 2X/3X bajos y energía LF.",
-                "Revisar: balanceo de rotor/acoplamiento, fijaciones, suciedad/excentricidad.",
-            ]
-        if _has_any(["Desalineaci", "Desalineación", "Desalineacion"]):
-            lines += [
-                "Motivo: armónicos 2X/3X elevados respecto a 1X.",
-                "Revisar: alineación de ejes, calces y base.",
-            ]
-        if _has_any(["Engranes", "Engranaje"]):
-            lines += [
-                "Motivo: componente de malla apreciable.",
-                "Revisar: desgaste, juego y lubricación.",
-            ]
-        if _has_any(["Rodamientos", "Rodamiento"]):
-            lines += [
-                "Motivo: picos en envolvente en frecuencias del rodamiento.",
-                "Revisar: lubricación, holgura y daño en pistas/elementos.",
-            ]
-        if _has_any(["Eléctrico", "Electrico", "El?ctrico", "El\u0019ctrico"]):
-            lines += [
-                "Motivo: componentes a frecuencia de línea y/o su 2x.",
-                "Revisar: balance de fases, variador, conexiones y carga del motor.",
-            ]
-        if _has_any(["Resonancia estructural", "Resonancia"]):
-            lines += [
-                "Motivo: picos agudos con Q alto.",
-                "Revisar: rigidez/apoyos, aprietes, prueba modal/FRF.",
-            ]
+        fft_peaks = fft.get("peaks", []) or []
+        df_fft = 0.0
+        try:
+            xf = fft.get("f_hz")
+            if xf is not None and len(xf) > 1:
+                df_fft = float(np.median(np.diff(np.asarray(xf, dtype=float))))
+        except Exception:
+            df_fft = 0.0
 
-        return lines
+        envelope = res.get("envelope", {}) or {}
+        env_peaks = envelope.get("peaks", []) or []
+        df_env = 0.0
+        try:
+            xf_env = envelope.get("f_hz")
+            if xf_env is not None and len(xf_env) > 1:
+                df_env = float(np.median(np.diff(np.asarray(xf_env, dtype=float))))
+        except Exception:
+            df_env = 0.0
+
+        def _nearest_fft_amp(freq: float) -> Optional[float]:
+            if not freq or freq <= 0:
+                return None
+            tol = max(0.02 * freq, (df_fft or 0.0) * 2.0 or 1.0)
+            best = 0.0
+            for pk in fft_peaks:
+                try:
+                    fpk = float(pk.get("f_hz", 0.0))
+                    apk = float(pk.get("amp", 0.0))
+                except Exception:
+                    continue
+                if fpk > 0 and abs(fpk - freq) <= tol and apk > best:
+                    best = apk
+            return best if best > 0 else None
+
+        def _nearest_env_amp(freq: float) -> Optional[float]:
+            if not freq or freq <= 0:
+                return None
+            tol = max(0.03 * freq, (df_env or 0.0) * 2.0 or 0.5)
+            best = 0.0
+            for pk in env_peaks:
+                try:
+                    fpk = float(pk.get("f_hz", 0.0))
+                    apk = float(pk.get("amp", 0.0))
+                except Exception:
+                    continue
+                if fpk > 0 and abs(fpk - freq) <= tol and apk > best:
+                    best = apk
+            return best if best > 0 else None
+
+        if _has(["Desbalanceo"]):
+            detail = "Indicadores de desbalanceo: "
+            if dom_freq > 0:
+                detail += f"1X={dom_freq:.2f} Hz ({dom_amp:.2f} mm/s). "
+            if r2x or r3x:
+                detail += f"Relación 2X={r2x:.2f}, 3X={r3x:.2f}. "
+            if frac_low:
+                detail += f"Energía baja {frac_low:.0%}."
+            _append_unique(diag_lines, detail.strip())
+            _append_unique(review_lines, "Revisar balanceo del rotor/acoplamiento, fijaciones y limpieza de rotor.")
+            _append_unique(reco_lines, "Programar balanceo dinámico y verificación de fijaciones tras la corrección.")
+
+        if _has(["Desalineaci", "Desalineación", "Desalineacion"]):
+            detail = (
+                "Armónicos 2X/3X elevados respecto a 1X"
+                f" (2X={r2x:.2f}, 3X={r3x:.2f})."
+            )
+            _append_unique(diag_lines, detail)
+            _append_unique(review_lines, "Inspeccionar alineación de ejes, calces y planitud de la base.")
+            _append_unique(reco_lines, "Realizar alineación láser o dial y confirmar holguras de acoplamiento.")
+
+        if _has(["Engranes", "Engranaje"]):
+            mesh_freq = None
+            for text in findings:
+                if text and "Engran" in text:
+                    m = re.search(r"~([0-9]+(?:\.[0-9]+)?)\s*Hz", text)
+                    if m:
+                        try:
+                            mesh_freq = float(m.group(1))
+                        except Exception:
+                            mesh_freq = None
+                    break
+            mesh_amp = _nearest_fft_amp(mesh_freq) if mesh_freq else None
+            if mesh_freq:
+                msg = f"Componente de engrane alrededor de {mesh_freq:.1f} Hz"
+                if mesh_amp:
+                    msg += f" ({mesh_amp:.3f} mm/s)."
+                else:
+                    msg += "."
+                _append_unique(diag_lines, msg)
+            else:
+                _append_unique(diag_lines, "Componente de engranes destacado en el espectro.")
+            _append_unique(review_lines, "Revisar condición de dientes, juego/backlash y lubricación del tren.")
+            _append_unique(reco_lines, "Programar inspección visual o boroscópica del engranaje y validar lubricación.")
+
+        bearing_tags: List[str] = []
+        for text in findings:
+            if not text:
+                continue
+            bearing_tags.extend(re.findall(r"(BPFO|BPFI|BSF|FTF)", text))
+        bearing_tags = list(dict.fromkeys(bearing_tags))
+        bearing_freqs = res.get("bearing_freqs", {}) or {}
+        if bearing_tags:
+            details: List[str] = []
+            for tag in bearing_tags:
+                freq = bearing_freqs.get(tag.lower())
+                if freq and freq > 0:
+                    amp = _nearest_env_amp(float(freq))
+                    if amp:
+                        details.append(f"{tag} ~{float(freq):.1f} Hz (envolvente {amp:.3f})")
+                    else:
+                        details.append(f"{tag} ~{float(freq):.1f} Hz")
+                else:
+                    details.append(tag)
+            _append_unique(diag_lines, "Indicadores de rodamiento: " + "; ".join(details) + ".")
+            _append_unique(review_lines, "Inspeccionar lubricación, holgura y condición de pistas y elementos rodantes.")
+            _append_unique(reco_lines, "Planificar análisis complementario (aceite/ultrasonido) o reemplazo del rodamiento según criticidad.")
+
+        if _has(["Eléctrico", "Electrico", "El?ctrico", "El\u0019ctrico"]):
+            line_freq = res.get("line_freq_hz")
+            if line_freq and line_freq > 0:
+                detail = f"Componentes eléctricos detectados cerca de {float(line_freq):.1f} Hz y su armónico."
+            else:
+                detail = "Componentes eléctricos alineados con la frecuencia de línea detectados."
+            _append_unique(diag_lines, detail)
+            _append_unique(review_lines, "Verificar balance de fases, conexiones y condición del variador si aplica.")
+            _append_unique(reco_lines, "Medir corriente/voltaje y corregir desequilibrios o armónicos en la alimentación.")
+
+        if _has(["Resonancia"]):
+            res_freq = None
+            res_q = None
+            for text in findings:
+                if text and "Resonancia" in text:
+                    m_f = re.search(r"~([0-9]+(?:\.[0-9]+)?)\s*Hz", text)
+                    m_q = re.search(r"Q~([0-9]+(?:\.[0-9]+)?)", text)
+                    if m_f:
+                        try:
+                            res_freq = float(m_f.group(1))
+                        except Exception:
+                            res_freq = None
+                    if m_q:
+                        try:
+                            res_q = float(m_q.group(1))
+                        except Exception:
+                            res_q = None
+                    break
+            if res_freq:
+                msg = f"Posible resonancia estructural cerca de {res_freq:.1f} Hz"
+                if res_q:
+                    msg += f" (Q≈{res_q:.1f})."
+                else:
+                    msg += "."
+                _append_unique(diag_lines, msg)
+            else:
+                _append_unique(diag_lines, "Comportamiento resonante identificado en el espectro.")
+            _append_unique(review_lines, "Revisar rigidez de soportes, aprietes y realizar prueba modal si es posible.")
+            _append_unique(reco_lines, "Evaluar cambios de rigidez/amortiguamiento o redistribución de masas para alejar la resonancia.")
+
+        if not review_lines:
+            if rms_mm >= 4.5:
+                _append_unique(review_lines, "Revisar historial de vibración y condición mecánica general del tren motriz.")
+            else:
+                _append_unique(review_lines, "Mantener inspecciones rutinarias y validar la medición en el siguiente ciclo.")
+
+        if not reco_lines:
+            if rms_mm >= 7.1:
+                _append_unique(reco_lines, "Recomendar intervención inmediata antes de continuar con operación prolongada.")
+            elif rms_mm >= 4.5:
+                _append_unique(reco_lines, "Programar corrección en el próximo paro planificado y seguir tendencia de vibración.")
+            else:
+                _append_unique(reco_lines, "Continuar con monitoreo periódico para confirmar estabilidad de la condición.")
+
+        if rpm > 0 and f1 == 0:
+            _append_unique(diag_lines, f"RPM estimada {rpm:.0f} (sin sincronización de 1X disponible).")
+
+        return diag_lines, review_lines, reco_lines
 
     def _acc_to_vel_time_mm(self, acc: np.ndarray, t: np.ndarray) -> np.ndarray:
         """
@@ -5049,13 +5485,48 @@ class MainApp:
 
         try:
 
+            if self.current_df is None or getattr(self.current_df, "empty", True):
+
+                chart = ft.Text("⚠️ No hay datos cargados")
+
+                self.multi_chart_container.content = chart
+
+                if self.multi_chart_container.page:
+
+                    self.multi_chart_container.update()
+
+                return
+
+            if getattr(self, "combine_signals_enabled", False):
+
+                data_tuple = self._get_time_signal_data()
+
+                if not data_tuple or data_tuple[0] is None or data_tuple[1] is None:
+
+                    chart = ft.Text("⚠️ No se pudo obtener la señal combinada")
+
+                    self.multi_chart_container.content = chart
+
+                    if self.multi_chart_container.page:
+
+                        self.multi_chart_container.update()
+
+                    return
+
             time_col = self.time_dropdown.value
 
             fft_signal_col = self.fft_dropdown.value
 
-            t = self.current_df[time_col].to_numpy()
+            data_tuple = self._get_time_signal_data()
+            if not data_tuple or data_tuple[0] is None or data_tuple[1] is None:
+                return ft.Text("⚠️ No se pudo obtener la señal principal", size=14, color="#e74c3c")
 
-            signal = self.current_df[fft_signal_col].to_numpy()
+            t, signal, signal_label = data_tuple
+
+            if signal_label is None:
+                signal_label = fft_signal_col
+
+            self._current_signal_label = signal_label
 
 
 
@@ -5250,7 +5721,7 @@ class MainApp:
 
             ax1.set_xlabel("Tiempo (s)")
 
-            ax1.set_ylabel("Aceleración [m/s²]")
+            ax1.set_ylabel(_ylabel)
 
             # Anotar RMS de Aceleracion (tiempo)
             try:
@@ -5539,9 +6010,10 @@ class MainApp:
 
             runup_chart = None
             try:
+                runup_msg = None
                 if getattr(self, 'runup_3d_cb', None) and getattr(self.runup_3d_cb, 'value', False):
                     zoom_tuple = (zmin, zmax) if zmin is not None else None
-                    runup_fig = self._generate_runup_3d_figure(
+                    runup_fig, runup_msg = self._generate_runup_3d_figure(
                         t_segment,
                         signal_segment,
                         fc,
@@ -5553,44 +6025,53 @@ class MainApp:
                     if runup_fig is not None:
                         runup_chart = MatplotlibChart(runup_fig, expand=True, isolated=True)
                         plt.close(runup_fig)
+                    elif runup_msg:
+                        runup_chart = ft.Text(f"⚠️ {runup_msg}")
+                if runup_msg:
+                    self._last_runup_warning = runup_msg
+                else:
+                    self._last_runup_warning = None
             except Exception:
+                self._last_runup_warning = None
                 runup_chart = None
 
 
             # --- Gráficas auxiliares ---
 
-            aux_plots = []
+            aux_plots: List[ft.Control] = []
 
-            for cb, color_dd, style_dd in self.aux_controls:
+            if not getattr(self, "combine_signals_enabled", False):
 
-                if cb.value:
+                for cb, color_dd, style_dd in self.aux_controls:
 
-                    aux_fig, aux_ax = plt.subplots(figsize=(8, 2))
+                    if cb.value:
 
-                    aux_ax.plot(
+                        aux_fig, aux_ax = plt.subplots(figsize=(8, 2))
 
-                        self.current_df[time_col],
+                        aux_ax.plot(
 
-                        self.current_df[cb.label],
+                            self.current_df[time_col],
 
-                        color=color_dd.value,
+                            self.current_df[cb.label],
 
-                        linestyle=style_dd.value,
+                            color=color_dd.value,
 
-                        linewidth=2,
+                            linestyle=style_dd.value,
 
-                        label=cb.label
+                            linewidth=2,
 
-                    )
+                            label=cb.label
 
-                    aux_ax.set_title(f"{cb.label} vs Tiempo")
+                        )
 
-                    aux_ax.legend()
+                        aux_ax.set_title(f"{cb.label} vs Tiempo")
 
-                    aux_fig.tight_layout()
+                        aux_ax.legend()
 
-                    aux_plots.append(MatplotlibChart(aux_fig, expand=True, isolated=True))
-                    plt.close(aux_fig)
+                        aux_fig.tight_layout()
+
+                        aux_plots.append(MatplotlibChart(aux_fig, expand=True, isolated=True))
+                        plt.close(aux_fig)
 
             # --- Resumen Ejecutivo (mm/s, formal al inicio) ---
             try:
@@ -5625,37 +6106,36 @@ class MainApp:
 
             # --- Panel resumen + diagnóstico ---
 
+            combined_sources = list(getattr(self, "_last_combined_sources", []) or [])
+            summary_items: List[ft.Control] = [
+                ft.Text("📊 Resumen del análisis", size=18, weight="bold"),
+                ft.Text(f"Periodo: {start_t:.2f}s – {end_t:.2f}s"),
+            ]
+            if signal_label:
+                summary_items.append(ft.Text(f"Señal analizada: {signal_label}"))
+            if combined_sources:
+                summary_items.append(
+                    ft.Text("Componentes combinados (RMS): " + ", ".join(combined_sources))
+                )
+            summary_items.extend([
+                ft.Text(f"Frecuencia dominante: {dom_freq:.2f} Hz"),
+                ft.Text(f"RMS velocidad: {rms_mm:.3f} mm/s"),
+                ft.Text(
+                    "Crest factor (aceleración): "
+                    f"{(float(np.max(np.abs(signal_segment))) / (float(self._calculate_rms(signal_segment)) + 1e-12)):.2f}"
+                ),
+                ft.Divider(),
+                ft.Text("🩺 Diagnóstico automático (baseline)", size=16, weight="bold"),
+                *[ft.Text(f"• {it}") for it in findings],
+            ])
+            if getattr(self, "_last_runup_warning", None):
+                summary_items.append(ft.Text(f"⚠️ Cascada 3D: {self._last_runup_warning}"))
+
             resumen = ft.Container(
-
-                content=ft.Column([
-
-                    ft.Text("📊 Resumen del análisis", size=18, weight="bold"),
-
-                    ft.Text(f"Periodo: {start_t:.2f}s – {end_t:.2f}s"),
-
-                    ft.Text(f"Frecuencia dominante: {dom_freq:.2f} Hz"),
-
-                    ft.Text(f"RMS velocidad: {rms_mm:.3f} mm/s"),
-
-                    ft.Text(
-                        f"Crest factor (aceleración): "
-                        f"{(float(np.max(np.abs(signal_segment))) / (float(self._calculate_rms(signal_segment)) + 1e-12)):.2f}"
-                    ),
-
-                    ft.Divider(),
-
-                    ft.Text("🩺 Diagnóstico automático (baseline)", size=16, weight="bold"),
-
-                    *[ft.Text(f"• {it}") for it in findings],
-
-                ], spacing=6),
-
+                content=ft.Column(summary_items, spacing=6),
                 bgcolor=ft.Colors.with_opacity(0.05, self._accent_ui()),
-
                 border_radius=10,
-
                 padding=10
-
             )
 
 
@@ -5671,11 +6151,36 @@ class MainApp:
                 _hide_lf = True
             _fft_filter_note = f"Filtro visual FFT: oculta < {_fc:.2f} Hz" if _hide_lf else "Filtro visual FFT: sin ocultar"
 
-            # Recalcular explicaciones con helper unificado (evita divergencias)
+            # Construir secciones detalladas de diagnóstico
             try:
-                exp_lines = self._build_explanations(res, findings)
+                diag_lines, review_lines, reco_lines = self._build_diagnostic_sections(res, findings)
             except Exception:
-                pass
+                diag_lines, review_lines, reco_lines = [], [], []
+
+            detail_controls: List[ft.Control] = []
+
+            def _add_section(title: str, lines: List[str]):
+                nonlocal detail_controls
+                if not lines:
+                    return
+                if detail_controls:
+                    detail_controls.append(ft.Divider())
+                detail_controls.append(ft.Text(title, size=16, weight="bold"))
+                detail_controls.extend(ft.Text(f"- {line}") for line in lines)
+
+            _add_section("Diagnóstico detallado", diag_lines)
+            _add_section("Revisión sugerida", review_lines)
+            _add_section("Recomendaciones", reco_lines)
+
+            if not detail_controls:
+                detail_controls.append(ft.Text("Sin observaciones adicionales."))
+
+            detail_section = ft.Container(
+                content=ft.Column(detail_controls, spacing=6),
+                bgcolor=ft.Colors.with_opacity(0.05, self._accent_ui()),
+                border_radius=10,
+                padding=10,
+            )
 
             # --- Contenedor con scroll (en Column, no en Container) ---
 
@@ -5687,17 +6192,9 @@ class MainApp:
 
                     controls=[
                         resumen_exec,
-                    ft.Container(
-                        content=ft.Column([
-                            ft.Text("Explicación y revisiones sugeridas", size=16, weight="bold"),
-                            *[ft.Text(f"- {it}") for it in exp_lines],
-                        ], spacing=6),
-                        bgcolor=ft.Colors.with_opacity(0.05, self._accent_ui()),
-                        border_radius=10,
-                        padding=10,
-                    ),
-                    ft.Text(_fft_filter_note),
-                    chart
+                        detail_section,
+                        ft.Text(_fft_filter_note),
+                        chart
                 ]
                     + ([runup_chart] if runup_chart else [])
                     + ([env_chart] if 'env_chart' in locals() and env_chart else [])
@@ -6585,76 +7082,6 @@ class MainApp:
         if self.files_list_view.page:  # Only update if added to page
             self.files_list_view.update()
 
-            file_name = file_path.split("/")[-1] if "/" in file_path else file_path.split("\\")[-1]
-
-            
-
-            file_card = ft.Container(
-
-                content=ft.Row(
-
-                    controls=[
-
-                        ft.Icon(ft.Icons.DESCRIPTION_ROUNDED, size=24),
-
-                        ft.Column(
-
-                            controls=[
-
-                                ft.Text(file_name, weight="bold", size=14),
-
-                                ft.Text(file_path, size=12, color="#7f8c8d"),
-
-                            ],
-
-                            expand=True,
-
-                        ),
-
-                        ft.IconButton(
-
-                            icon=ft.Icons.DELETE_OUTLINE_ROUNDED,
-
-                            tooltip="Eliminar archivo",
-
-                            on_click=lambda e, path=file_path: self._remove_file(path),
-
-                        ),
-
-                        ft.IconButton(
-
-                            icon=ft.Icons.VISIBILITY_ROUNDED,
-
-                            tooltip="Seleccionar para análisis",
-
-                            on_click=lambda e, path=file_path: self._load_file_data(path),
-
-                        ),
-
-                    ],
-
-                    alignment="space_between",
-
-                ),
-
-                padding=15,
-
-                border_radius=10,
-
-                bgcolor=ft.Colors.with_opacity(0.05, self._accent_ui()),
-
-                on_hover=lambda e: self._on_file_hover(e),
-
-            )
-
-            self.files_list_view.controls.append(file_card)
-
-        
-
-        if self.files_list_view.page:  # Only update if added to page
-
-            self.files_list_view.update()
-
 
 
     def _on_file_hover(self, e):
@@ -6997,6 +7424,7 @@ class MainApp:
             self.page.client_storage.set("combine_signals_enabled", self.combine_signals_enabled)
         except Exception:
             pass
+        self._refresh_aux_control_state()
         self._update_analysis()
         try:
             self._update_multi_chart()
@@ -7018,170 +7446,77 @@ class MainApp:
 
 
     def _update_multi_chart(self, e=None, normalize=True):
-
-        """
-
-        Genera gráfica combinada de FFTs seleccionadas.
-
-        - normalize=True: escala cada señal entre 0–1 para ver todas.
-
-        """
-
+        """Actualiza la vista combinada mostrando una única señal en el dominio del tiempo."""
         try:
-
-            time_col = self.time_dropdown.value
-
-            t = self.current_df[time_col].to_numpy()
-
-            selected_signals = [cb.label for cb in self.signal_checkboxes if cb.value]
-
-
-
-            if not selected_signals:
-
-                chart = ft.Text("⚠️ No hay señales seleccionadas")
-
-            else:
-
-                plt.style.use('dark_background' if self.is_dark_mode else 'seaborn-v0_8-whitegrid')
-
-                fig, ax = plt.subplots(figsize=(12, 5))
-
-
-
-                # Vista en dBV real opcional (aplica a todas las curvas)
-                try:
-                    use_dbv = bool(getattr(self, 'db_scale_cb', None) and getattr(self.db_scale_cb, 'value', False))
-                except Exception:
-                    use_dbv = False
-                # Calibración para dBV
-                try:
-                    sens_unit = getattr(self, 'sens_unit_dd', None).value if getattr(self, 'sens_unit_dd', None) else 'mV/g'
-                except Exception:
-                    sens_unit = 'mV/g'
-                try:
-                    sens_val = float(getattr(self, 'sensor_sens_field', None).value) if getattr(self, 'sensor_sens_field', None) else 100.0
-                except Exception:
-                    sens_val = 100.0
-                try:
-                    gain_vv = float(getattr(self, 'gain_field', None).value) if getattr(self, 'gain_field', None) else 1.0
-                except Exception:
-                    gain_vv = 1.0
-
-                # Filtros de frecuencia visuales
-                try:
-                    fmin_ui = float(self.lf_cutoff_field.value) if getattr(self, 'lf_cutoff_field', None) and getattr(self.lf_cutoff_field, 'value', '') else 0.0
-                except Exception:
-                    fmin_ui = 0.0
-                try:
-                    fmax_ui = float(self.hf_limit_field.value) if getattr(self, 'hf_limit_field', None) and getattr(self.hf_limit_field, 'value', '') else None
-                except Exception:
-                    fmax_ui = None
-
-                for sig in selected_signals:
-
-                    y = self.current_df[sig].to_numpy()
-
-                    N = len(y)
-
-                    if N < 2:
-
-                        continue
-
-                    T = t[1] - t[0]
-
-                    yf = np.fft.fft(y)
-
-                    xf = np.fft.fftfreq(N, T)[:N // 2]
-
-                    mag_acc = 2.0 / N * np.abs(yf[0:N // 2])
-
-                    mag_vel_mm = np.zeros_like(mag_acc)
-
-                    mag_vel_mm[xf > 0] = (mag_acc[xf > 0] / (2 * np.pi * xf[xf > 0])) * 1000
-
-
-
-                    # Aplicar máscara de frecuencia
-                    mask = xf >= max(0.0, fmin_ui)
-                    if fmax_ui and fmax_ui > 0:
-                        mask = mask & (xf <= fmax_ui)
-
-                    if use_dbv:
-                        if sens_unit == 'mV/g':
-                            sens_v_per_g = sens_val * 1e-3
-                            V_amp = (mag_acc / 9.80665) * sens_v_per_g * gain_vv
-                        elif sens_unit == 'V/g':
-                            V_amp = (mag_acc / 9.80665) * sens_val * gain_vv
-                        elif sens_unit == 'mV/(mm/s)':
-                            V_amp = mag_vel_mm * (sens_val * 1e-3) * gain_vv
-                        elif sens_unit == 'V/(mm/s)':
-                            V_amp = mag_vel_mm * sens_val * gain_vv
-                        else:
-                            V_amp = mag_vel_mm * 0.0
-                        eps = 1e-12
-                        yplot = 20.0 * np.log10(np.maximum(np.asarray(V_amp, dtype=float), eps) / 1.0)
-                        ax.plot(xf[mask], yplot[mask], linewidth=2, label=sig)
+            chart = None
+            data_tuple = self._get_time_signal_data()
+            if not data_tuple or data_tuple[0] is None or data_tuple[1] is None:
+                if getattr(self, "combine_signals_enabled", False):
+                    selected = self._collect_selected_signals()
+                    if len(selected) < 2:
+                        chart = ft.Text("⚠️ Selecciona las señales que deseas unificar para graficarlas.")
                     else:
-                        if normalize and mag_vel_mm.max() > 0:
-                            mag_vel_mm = mag_vel_mm / mag_vel_mm.max()
-                        ax.plot(xf[mask], mag_vel_mm[mask], linewidth=2, label=sig)
-
-
-
-                ax.set_title("FFT combinada de señales")
-
-                ax.set_xlabel("Frecuencia (Hz)")
-
-                if use_dbv:
-                    ax.set_ylabel("Nivel [dBV]")
-                    # Rango Y en dBV si se definió
-                    try:
-                        ymin = float(self.db_ymin_field.value) if getattr(self, 'db_ymin_field', None) and getattr(self.db_ymin_field, 'value', '') != '' else None
-                    except Exception:
-                        ymin = None
-                    try:
-                        ymax = float(self.db_ymax_field.value) if getattr(self, 'db_ymax_field', None) and getattr(self.db_ymax_field, 'value', '') != '' else None
-                    except Exception:
-                        ymax = None
-                    if ymin is not None or ymax is not None:
-                        cur = ax.get_ylim()
-                        ax.set_ylim(ymin if ymin is not None else cur[0], ymax if ymax is not None else cur[1])
+                        chart = ft.Text("⚠️ No se pudo construir la señal combinada.")
                 else:
-                    ax.set_ylabel("Velocidad [mm/s]" if not normalize else "Amplitud normalizada")
-
-                try:
-                    if fmax_ui and fmax_ui > 0:
-                        ax.set_xlim(left=0.0, right=float(fmax_ui))
-                    if fmin_ui and fmin_ui > 0:
-                        cur = ax.get_xlim()
-                        ax.set_xlim(left=float(fmin_ui), right=cur[1])
-                except Exception:
-                    pass
-                ax.legend(ncol=2, fontsize=8)
-
-
-
-                chart = MatplotlibChart(fig, expand=True, isolated=True)
-
-                plt.close(fig)
-
-            self.multi_chart_container.content = chart
-
-            if self.multi_chart_container.page:
-
-                self.multi_chart_container.update()
-
+                    chart = ft.Text("⚠️ No hay señal principal disponible para graficar.")
+            else:
+                t, signal, signal_label = data_tuple
+                if signal_label is None:
+                    try:
+                        signal_label = getattr(self.fft_dropdown, "value", None)
+                    except Exception:
+                        signal_label = None
+                if t is None or signal is None or len(t) < 2 or len(signal) < 2:
+                    chart = ft.Text("⚠️ Datos insuficientes para graficar la señal en el tiempo.")
+                else:
+                    plt.style.use('dark_background' if self.is_dark_mode else 'seaborn-v0_8-whitegrid')
+                    fig, ax = plt.subplots(figsize=(12, 5))
+                    try:
+                        unit_mode = getattr(self, "time_unit_dd", None).value if getattr(self, "time_unit_dd", None) else "vel_mm"
+                    except Exception:
+                        unit_mode = "vel_mm"
+                    if unit_mode == "vel_mm":
+                        y_plot = self._acc_to_vel_time_mm(signal, t)
+                        ylabel = "Velocidad [mm/s]"
+                        rms_text = f"RMS vel: {self._calculate_rms(y_plot):.3f} mm/s" if y_plot.size else "RMS vel: 0.000 mm/s"
+                    elif unit_mode == "acc_g":
+                        y_plot = signal / 9.80665
+                        ylabel = "Aceleración [g]"
+                        rms_text = f"RMS acc: {self._calculate_rms(y_plot):.3f} g"
+                    else:
+                        y_plot = signal
+                        ylabel = "Aceleración [m/s²]"
+                        rms_text = f"RMS acc: {self._calculate_rms(y_plot):.3e} m/s²"
+                    color = self.time_plot_color or "#00bcd4"
+                    ax.plot(t, y_plot, color=color, linewidth=2, label=signal_label or "Señal principal")
+                    ax.set_title("Señal principal en el tiempo")
+                    ax.set_xlabel("Tiempo (s)")
+                    ax.set_ylabel(ylabel)
+                    try:
+                        text_color = "white" if self.is_dark_mode else "black"
+                        ax.text(0.02, 0.95, rms_text, transform=ax.transAxes, va="top", color=text_color)
+                    except Exception:
+                        pass
+                    try:
+                        if signal_label:
+                            ax.legend(loc="upper right")
+                    except Exception:
+                        pass
+                    ax.grid(True, alpha=0.25)
+                    chart = MatplotlibChart(fig, expand=True, isolated=True)
+                    plt.close(fig)
+            if chart is not None:
+                self.multi_chart_container.content = chart
+                if self.multi_chart_container.page:
+                    self.multi_chart_container.update()
         except Exception as ex:
-
-            self._log(f"Error en gráfica combinada: {ex}")
-
+            try:
+                self._log(f"Error en gráfica combinada: {ex}")
+            except Exception:
+                pass
             self.multi_chart_container.content = ft.Text(f"Error en gráfica combinada: {ex}")
-
             if self.multi_chart_container.page:
-
                 self.multi_chart_container.update()
-
 
 
 # =========================
