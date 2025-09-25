@@ -1697,13 +1697,18 @@ class MainApp:
 
     def _collect_selected_signals(self) -> List[str]:
         try:
-            return [
+            labels = [
                 cb.label
                 for cb in getattr(self, "signal_checkboxes", [])
                 if getattr(cb, "value", False)
             ]
         except Exception:
-            return []
+            labels = []
+        # Eliminar duplicados conservando el orden
+        try:
+            return list(dict.fromkeys(labels))
+        except Exception:
+            return labels
 
     def _sync_select_all_checkbox(self):
         try:
@@ -1750,12 +1755,20 @@ class MainApp:
                 self._update_multi_chart()
             except Exception:
                 pass
+            try:
+                self._update_analysis()
+            except Exception:
+                pass
         self._sync_select_all_checkbox()
 
     def _on_signal_checkbox_change(self, e=None):
         self._sync_select_all_checkbox()
         try:
             self._update_multi_chart()
+        except Exception:
+            pass
+        try:
+            self._update_analysis()
         except Exception:
             pass
 
@@ -1765,8 +1778,13 @@ class MainApp:
                 return None
             data = self.current_df[columns].apply(pd.to_numeric, errors="coerce")
             arr = np.nan_to_num(data.to_numpy(dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
-            if arr.ndim != 2 or arr.shape[1] < 2:
+            if arr.ndim == 1:
+                arr = arr.reshape(-1, 1)
+            if arr.shape[1] == 0:
                 return None
+            if arr.shape[1] == 1:
+                # Si solo hay una columna útil, devolverla tal cual para mantener compatibilidad.
+                return arr[:, 0]
             return np.sqrt(np.sum(np.square(arr), axis=1))
         except Exception:
             return None
@@ -1797,11 +1815,14 @@ class MainApp:
 
         if getattr(self, "combine_signals_enabled", False):
             selected_cols = self._collect_selected_signals()
-            if selected_cols:
-                if signal_col not in selected_cols:
-                    selected_cols.append(signal_col)
-            else:
-                selected_cols = [signal_col]
+            if not selected_cols:
+                try:
+                    numeric_cols = self.current_df.select_dtypes(include=[np.number]).columns.tolist()
+                except Exception:
+                    numeric_cols = []
+                selected_cols = [col for col in numeric_cols if col != time_col]
+            if signal_col not in selected_cols and signal_col != time_col:
+                selected_cols.append(signal_col)
             valid_cols = [col for col in selected_cols if col in self.current_df.columns and col != time_col]
             # Eliminar duplicados preservando orden
             valid_cols = list(dict.fromkeys(valid_cols))
@@ -1809,10 +1830,15 @@ class MainApp:
             combined = None
             if len(valid_cols) >= 2:
                 combined = self._build_combined_signal(valid_cols)
+            elif len(valid_cols) == 1:
+                combined = self._build_combined_signal(valid_cols)
             if combined is not None and combined.shape[0] == signal.shape[0]:
                 signal = combined
                 combined_sources = valid_cols
-                combined_label = f"RMS({', '.join(valid_cols)})"
+                if len(valid_cols) >= 2:
+                    combined_label = f"RMS({', '.join(valid_cols)})"
+                else:
+                    combined_label = valid_cols[0]
 
         prev_sources = getattr(self, "_last_combined_sources", [])
         if combined_sources != prev_sources:
