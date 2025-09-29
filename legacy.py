@@ -157,6 +157,109 @@ def _charlotte_faults_lines() -> List[str]:
     return lines
 
 
+def _build_charlotte_reference_table(
+    entries: Optional[List[Dict[str, str]]],
+    styles,
+    accent_color,
+):
+    """Genera una tabla con estilo para la referencia de Charlotte que respete los anchos."""
+
+    if not entries:
+        return None
+
+    style_map = getattr(styles, "byName", {})
+
+    if "CharlotteHeader" not in style_map:
+        styles.add(
+            ParagraphStyle(
+                "CharlotteHeader",
+                parent=styles["Heading4"],
+                textColor=colors.white,
+                alignment=1,
+                fontSize=10,
+                leading=12,
+                spaceAfter=0,
+            )
+        )
+    if "CharlotteCode" not in style_map:
+        styles.add(
+            ParagraphStyle(
+                "CharlotteCode",
+                parent=styles["Normal"],
+                alignment=1,
+                textColor=accent_color,
+                fontSize=9,
+                leading=11,
+                fontName="Helvetica-Bold",
+                spaceAfter=0,
+            )
+        )
+    if "CharlotteName" not in style_map:
+        styles.add(
+            ParagraphStyle(
+                "CharlotteName",
+                parent=styles["Normal"],
+                fontSize=9.5,
+                leading=11,
+                textColor=colors.HexColor("#2c3e50"),
+                spaceAfter=1,
+            )
+        )
+    if "CharlotteDescription" not in style_map:
+        styles.add(
+            ParagraphStyle(
+                "CharlotteDescription",
+                parent=styles["Normal"],
+                fontSize=8.5,
+                leading=10.5,
+                textColor=colors.HexColor("#4d5b6a"),
+                spaceAfter=3,
+            )
+        )
+
+    header = [
+        Paragraph("<b>Código</b>", styles["CharlotteHeader"]),
+        Paragraph("<b>Falla</b>", styles["CharlotteHeader"]),
+        Paragraph("<b>Descripción</b>", styles["CharlotteHeader"]),
+    ]
+
+    rows: List[List[Any]] = [header]
+    for entry in entries:
+        code = str(entry.get("code", "-"))
+        name = str(entry.get("name", ""))
+        desc = str(entry.get("description", ""))
+        rows.append(
+            [
+                Paragraph(code, styles["CharlotteCode"]),
+                Paragraph(name, styles["CharlotteName"]),
+                Paragraph(desc, styles["CharlotteDescription"]),
+            ]
+        )
+
+    table = Table(rows, colWidths=[60, 160, 270])
+    table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), accent_color),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.HexColor("#f7faff"), colors.white]),
+                ("BACKGROUND", (0, 1), (0, -1), colors.HexColor("#e9f2ff")),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTNAME", (0, 1), (0, -1), "Helvetica-Bold"),
+                ("TEXTCOLOR", (0, 1), (0, -1), accent_color),
+                ("LEFTPADDING", (0, 0), (-1, -1), 8),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+                ("TOPPADDING", (0, 0), (-1, -1), 6),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#c7d3e3")),
+            ]
+        )
+    )
+    return table
+
+
 def _split_diagnosis(findings: Optional[List[str]]) -> Tuple[Optional[str], List[str]]:
     """Separa la entrada de severidad ISO del resto de hallazgos."""
     severity: Optional[str] = None
@@ -2782,27 +2885,11 @@ class MainApp:
             if charlotte_catalog_pdf:
                 elements.append(PageBreak())
                 elements.append(Paragraph("Referencia Tabla de Charlotte (Motores eléctricos)", styles['SectionHeading']))
-                charlotte_rows = [["Código", "Falla", "Descripción"]]
-                for entry in charlotte_catalog_pdf:
-                    code = str(entry.get('code', '-'))
-                    name = str(entry.get('name', ''))
-                    desc = str(entry.get('description', ''))
-                    charlotte_rows.append([code, name, desc])
-                charlotte_table = Table(charlotte_rows, colWidths=[70, 160, 270])
-                charlotte_table.setStyle(
-                    TableStyle(
-                        [
-                            ("BACKGROUND", (0, 0), (-1, 0), accent_color),
-                            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                            ("FONTNAME", (0, 0), (-1, 0), 'Helvetica-Bold'),
-                            ("ALIGN", (0, 0), (-1, 0), "CENTER"),
-                            ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.white]),
-                            ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#bdc3c7")),
-                        ]
-                    )
+                charlotte_table = _build_charlotte_reference_table(
+                    charlotte_catalog_pdf, styles, accent_color
                 )
-                elements.append(charlotte_table)
+                if charlotte_table is not None:
+                    elements.append(charlotte_table)
 
             doc.build(elements)
 
@@ -3970,27 +4057,11 @@ class MainApp:
             if charlotte_catalog_pdf:
                 elements.append(PageBreak())
                 elements.append(Paragraph("Referencia Tabla de Charlotte (Motores eléctricos)", styles['SectionHeading']))
-                charlotte_rows = [["Código", "Falla", "Descripción"]]
-                for entry in charlotte_catalog_pdf:
-                    code = str(entry.get('code', '-'))
-                    name = str(entry.get('name', ''))
-                    desc = str(entry.get('description', ''))
-                    charlotte_rows.append([code, name, desc])
-                charlotte_table = Table(charlotte_rows, colWidths=[70, 160, 270])
-                charlotte_table.setStyle(
-                    TableStyle(
-                        [
-                            ("BACKGROUND", (0, 0), (-1, 0), accent_color),
-                            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                            ("FONTNAME", (0, 0), (-1, 0), 'Helvetica-Bold'),
-                            ("ALIGN", (0, 0), (-1, 0), "CENTER"),
-                            ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.white]),
-                            ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#bdc3c7")),
-                        ]
-                    )
+                charlotte_table = _build_charlotte_reference_table(
+                    charlotte_catalog_pdf, styles, accent_color
                 )
-                elements.append(charlotte_table)
+                if charlotte_table is not None:
+                    elements.append(charlotte_table)
 
             doc.build(elements)
 
