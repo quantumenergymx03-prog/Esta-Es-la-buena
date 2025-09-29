@@ -20,13 +20,259 @@ from typing import Optional, Tuple, Dict, Any, List
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  # Needed for 3D projections
 # --- PDF reportlab imports ---
 from reportlab.lib.pagesizes import A4
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle, PageBreak
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Paragraph,
+    Spacer,
+    Image,
+    Table,
+    TableStyle,
+    PageBreak,
+    ListFlowable,
+    ListItem,
+)
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 import tempfile
 import shutil
 
 APP_VERSION = "v1.0.0"
+
+# Conjunto de fallas consideradas en la Tabla de Charlotte para motores eléctricos.
+# Cada entrada incluye un identificador, el nombre de la falla y una descripción breve
+# para contextualizar al usuario durante la interpretación del diagnóstico automático.
+CHARLOTTE_MOTOR_FAULTS: List[Dict[str, str]] = [
+    {
+        "code": "EM01",
+        "name": "Desbalanceo del rotor",
+        "description": "Vibración 1X dominante en dirección radial; aumenta con las RPM.",
+    },
+    {
+        "code": "EM02",
+        "name": "Desalineación angular",
+        "description": "Elevación de 2X y 3X, con componentes axiales pronunciados.",
+    },
+    {
+        "code": "EM03",
+        "name": "Desalineación paralela",
+        "description": "Componentes 1X y 2X en dirección radial y axial con desfase entre soportes.",
+    },
+    {
+        "code": "EM04",
+        "name": "Holgura mecánica",
+        "description": "Multiplicidad de armónicos de 1X y presencia de impactos o subarmónicos.",
+    },
+    {
+        "code": "EM05",
+        "name": "Holgura estructural / base suelta",
+        "description": "Respuesta amplia entre 1X y 3X acompañada de modulación irregular.",
+    },
+    {
+        "code": "EM06",
+        "name": "Resonancia estructural",
+        "description": "Picos muy agudos con factor Q alto y sensibilidad extrema a pequeños cambios.",
+    },
+    {
+        "code": "EM07",
+        "name": "Soft foot (pata coja)",
+        "description": "Variaciones de fase/1X durante el apriete de pernos y fuerte componente axial.",
+    },
+    {
+        "code": "EM08",
+        "name": "Eje doblado",
+        "description": "1X dominante con fuertes componentes axiales y segundo armónico moderado.",
+    },
+    {
+        "code": "EM09",
+        "name": "Rotor excéntrico",
+        "description": "1X radial elevado acompañado de bandas laterales sincronizadas con RPM.",
+    },
+    {
+        "code": "EM10",
+        "name": "Barras de rotor rotas",
+        "description": "Bandas laterales alrededor de 1X y 2X, modulación a frecuencia de resbalamiento.",
+    },
+    {
+        "code": "EM11",
+        "name": "Rotor flojo / roce de rotor",
+        "description": "Vibración subsíncrona, impactos y crecimiento de armónicos impares.",
+    },
+    {
+        "code": "EM12",
+        "name": "Problemas eléctricos del estator",
+        "description": "Componentes a 2X línea y picos a 1X línea +/- 1X mecánico.",
+    },
+    {
+        "code": "EM13",
+        "name": "Desequilibrio de tensión / armónicos de línea",
+        "description": "Elevación persistente de 2X y 3X de línea y modulación armónica.",
+    },
+    {
+        "code": "EM14",
+        "name": "Rodamiento - pista externa",
+        "description": "Frecuencias BPFO y sus armónicos con posibles bandas laterales a 1X.",
+    },
+    {
+        "code": "EM15",
+        "name": "Rodamiento - pista interna",
+        "description": "Frecuencias BPFI dominantes y modulación con 1X o frecuencia de rotación.",
+    },
+    {
+        "code": "EM16",
+        "name": "Rodamiento - elemento rodante",
+        "description": "BSF y sus armónicos con envolvente rica en alta frecuencia.",
+    },
+    {
+        "code": "EM17",
+        "name": "Rodamiento - jaula / separador",
+        "description": "FTF y subarmónicos, a menudo acompañados de impulsos repetitivos.",
+    },
+    {
+        "code": "EM18",
+        "name": "Lubricación deficiente o contaminación",
+        "description": "Crecimiento amplio en alta frecuencia y elevación del ruido de fondo.",
+    },
+    {
+        "code": "EM19",
+        "name": "Problemas en acoplamiento",
+        "description": "Combinación de armónicos 1X-3X y variaciones según la carga transmitida.",
+    },
+    {
+        "code": "EM20",
+        "name": "Ventilador o elementos auxiliares",
+        "description": "Picos a frecuencias de aspas/paletas y subarmónicos modulados.",
+    },
+]
+
+
+def _charlotte_faults_lines() -> List[str]:
+    """Devuelve las descripciones formateadas de las fallas Charlotte para motores."""
+    lines: List[str] = []
+    for entry in CHARLOTTE_MOTOR_FAULTS:
+        code = entry.get("code", "-")
+        name = entry.get("name", "Falla")
+        desc = entry.get("description", "")
+        formatted = f"• {code} – {name}: {desc}"
+        lines.append(formatted)
+    return lines
+
+
+def _build_charlotte_reference_table(
+    entries: Optional[List[Dict[str, str]]],
+    styles,
+    accent_color,
+):
+    """Genera una tabla con estilo para la referencia de Charlotte que respete los anchos."""
+
+    if not entries:
+        return None
+
+    style_map = getattr(styles, "byName", {})
+
+    if "CharlotteHeader" not in style_map:
+        styles.add(
+            ParagraphStyle(
+                "CharlotteHeader",
+                parent=styles["Heading4"],
+                textColor=colors.white,
+                alignment=1,
+                fontSize=10,
+                leading=12,
+                spaceAfter=0,
+            )
+        )
+    if "CharlotteCode" not in style_map:
+        styles.add(
+            ParagraphStyle(
+                "CharlotteCode",
+                parent=styles["Normal"],
+                alignment=1,
+                textColor=accent_color,
+                fontSize=9,
+                leading=11,
+                fontName="Helvetica-Bold",
+                spaceAfter=0,
+            )
+        )
+    if "CharlotteName" not in style_map:
+        styles.add(
+            ParagraphStyle(
+                "CharlotteName",
+                parent=styles["Normal"],
+                fontSize=9.5,
+                leading=11,
+                textColor=colors.HexColor("#2c3e50"),
+                spaceAfter=1,
+            )
+        )
+    if "CharlotteDescription" not in style_map:
+        styles.add(
+            ParagraphStyle(
+                "CharlotteDescription",
+                parent=styles["Normal"],
+                fontSize=8.5,
+                leading=10.5,
+                textColor=colors.HexColor("#4d5b6a"),
+                spaceAfter=3,
+            )
+        )
+
+    header = [
+        Paragraph("<b>Código</b>", styles["CharlotteHeader"]),
+        Paragraph("<b>Falla</b>", styles["CharlotteHeader"]),
+        Paragraph("<b>Descripción</b>", styles["CharlotteHeader"]),
+    ]
+
+    rows: List[List[Any]] = [header]
+    for entry in entries:
+        code = str(entry.get("code", "-"))
+        name = str(entry.get("name", ""))
+        desc = str(entry.get("description", ""))
+        rows.append(
+            [
+                Paragraph(code, styles["CharlotteCode"]),
+                Paragraph(name, styles["CharlotteName"]),
+                Paragraph(desc, styles["CharlotteDescription"]),
+            ]
+        )
+
+    table = Table(rows, colWidths=[60, 160, 270])
+    table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), accent_color),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.HexColor("#f7faff"), colors.white]),
+                ("BACKGROUND", (0, 1), (0, -1), colors.HexColor("#e9f2ff")),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTNAME", (0, 1), (0, -1), "Helvetica-Bold"),
+                ("TEXTCOLOR", (0, 1), (0, -1), accent_color),
+                ("LEFTPADDING", (0, 0), (-1, -1), 8),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+                ("TOPPADDING", (0, 0), (-1, -1), 6),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#c7d3e3")),
+            ]
+        )
+    )
+    return table
+
+
+def _split_diagnosis(findings: Optional[List[str]]) -> Tuple[Optional[str], List[str]]:
+    """Separa la entrada de severidad ISO del resto de hallazgos."""
+    severity: Optional[str] = None
+    core: List[str] = []
+    if not findings:
+        return severity, core
+    for item in findings:
+        text = str(item)
+        if severity is None and text.lower().startswith("severidad iso"):
+            severity = text
+            continue
+        core.append(text)
+    return severity, core
 
 # =========================
 #   Utilidades de rodamientos (frecuencias teóricas)
@@ -591,6 +837,7 @@ def analyze_vibration(
         pass
     if len(findings) == 1:
         findings.append("Sin anomalías evidentes según reglas actuales.")
+    severity_summary, core_findings = _split_diagnosis(findings)
     return {
         "segment_used": (float(t[0]), float(t[-1])),
         "fs_hz": fs,
@@ -625,6 +872,10 @@ def analyze_vibration(
         "f1_hz": f1,
         "severity": {"label": sev_label, "color": sev_color, "rms_mm_s": rms_vel_spec_mm},
         "diagnosis": findings,
+        "diagnosis_summary": severity_summary,
+        "diagnosis_findings": core_findings,
+        "charlotte_catalog": [dict(entry) for entry in CHARLOTTE_MOTOR_FAULTS],
+        "charlotte_lines": _charlotte_faults_lines(),
     }
 
 
@@ -834,6 +1085,11 @@ class MainApp:
         self.data_show_favs_only = self._get_bool_storage("data_favs_only", False)
         # Preferencias de análisis avanzados
         self.runup_3d_enabled = self._get_bool_storage("runup_3d_enabled", False)
+        self.orbit_plot_enabled = self._get_bool_storage("orbit_plot_enabled", False)
+        stored_orbit_x = self.page.client_storage.get("orbit_axis_x")
+        stored_orbit_y = self.page.client_storage.get("orbit_axis_y")
+        self.orbit_axis_x_pref = stored_orbit_x if isinstance(stored_orbit_x, str) else None
+        self.orbit_axis_y_pref = stored_orbit_y if isinstance(stored_orbit_y, str) else None
 
 
 
@@ -1694,6 +1950,27 @@ class MainApp:
             stored = None
         return self._sanitize_color(stored, default)
 
+    def _remember_orbit_axis(self, axis: str, value: Optional[str]):
+        key = "orbit_axis_x" if str(axis).lower().startswith("x") else "orbit_axis_y"
+        if str(axis).lower().startswith("x"):
+            self.orbit_axis_x_pref = value
+        else:
+            self.orbit_axis_y_pref = value
+        try:
+            storage = getattr(self.page, "client_storage", None)
+            if not storage:
+                return
+            if value:
+                storage.set(key, value)
+            else:
+                remover = getattr(storage, "remove", None)
+                if callable(remover):
+                    remover(key)
+                else:
+                    storage.set(key, "")
+        except Exception:
+            pass
+
     def _collect_selected_signals(self) -> List[str]:
         try:
             return [
@@ -2002,6 +2279,13 @@ class MainApp:
             self._last_tseg = t_seg
             self._last_accseg = sig_seg
             findings_pdf = res.get('diagnosis', [])
+            severity_entry_pdf = res.get('diagnosis_summary')
+            findings_core_pdf = list(res.get('diagnosis_findings', []) or [])
+            if not findings_core_pdf and findings_pdf:
+                _, findings_core_pdf = _split_diagnosis(findings_pdf)
+            charlotte_catalog_pdf = list(res.get('charlotte_catalog', []) or [])
+            if not charlotte_catalog_pdf:
+                charlotte_catalog_pdf = [dict(entry) for entry in CHARLOTTE_MOTOR_FAULTS]
 
             tmp_imgs = []
             def save_plot(fig):
@@ -2250,6 +2534,39 @@ class MainApp:
             except Exception:
                 img_runup = None
 
+            img_orbit = None
+            try:
+                orbit_enabled = False
+                if getattr(self, 'orbit_cb', None):
+                    orbit_enabled = bool(getattr(self.orbit_cb, 'value', False))
+                else:
+                    orbit_enabled = bool(getattr(self, 'orbit_plot_enabled', False))
+                if orbit_enabled:
+                    x_col = getattr(self, 'orbit_x_dd', None).value if getattr(self, 'orbit_x_dd', None) else self.orbit_axis_x_pref
+                    y_col = getattr(self, 'orbit_y_dd', None).value if getattr(self, 'orbit_y_dd', None) else self.orbit_axis_y_pref
+                    if x_col and y_col and x_col in self.current_df.columns and y_col in self.current_df.columns:
+                        try:
+                            x_seg_pdf = self.current_df.loc[mask, x_col].to_numpy()
+                            y_seg_pdf = self.current_df.loc[mask, y_col].to_numpy()
+                        except Exception:
+                            x_seg_pdf = self.current_df[x_col].to_numpy()
+                            y_seg_pdf = self.current_df[y_col].to_numpy()
+                        orbit_fig = self._generate_orbit_figure(
+                            t_seg,
+                            x_seg_pdf,
+                            y_seg_pdf,
+                            x_col,
+                            y_col,
+                            fc,
+                            hide_lf,
+                            fmax_ui,
+                            False,
+                        )
+                        if orbit_fig is not None:
+                            img_orbit = save_plot(orbit_fig)
+            except Exception:
+                img_orbit = None
+
             aux_imgs = []
             aux_selected = []
             try:
@@ -2272,7 +2589,60 @@ class MainApp:
 
             doc = SimpleDocTemplate(pdf_path, pagesize=A4)
             styles = getSampleStyleSheet()
-            title_style = ParagraphStyle("title", parent=styles['Title'], textColor=colors.HexColor(self._accent_hex()))
+            try:
+                accent_hex = self._accent_hex()
+            except Exception:
+                accent_hex = "#1f77b4"
+            try:
+                accent_color = colors.HexColor(accent_hex)
+            except Exception:
+                accent_color = colors.HexColor("#1f77b4")
+            title_style = ParagraphStyle(
+                "title",
+                parent=styles['Title'],
+                textColor=accent_color,
+                spaceAfter=12,
+            )
+            styles.add(
+                ParagraphStyle(
+                    "HeadingAccent",
+                    parent=styles['Heading1'],
+                    textColor=accent_color,
+                    spaceAfter=8,
+                )
+            )
+            styles.add(
+                ParagraphStyle(
+                    "SectionHeading",
+                    parent=styles['Heading2'],
+                    textColor=accent_color,
+                    spaceBefore=12,
+                    spaceAfter=6,
+                )
+            )
+            styles.add(
+                ParagraphStyle(
+                    "BulletItem",
+                    parent=styles['Normal'],
+                    leftIndent=18,
+                    spaceAfter=4,
+                )
+            )
+
+            def _apply_table_style(tbl: Table) -> None:
+                tbl.setStyle(
+                    TableStyle(
+                        [
+                            ("BACKGROUND", (0, 0), (-1, 0), accent_color),
+                            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                            ("FONTNAME", (0, 0), (-1, 0), 'Helvetica-Bold'),
+                            ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+                            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.white]),
+                            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                            ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#bdc3c7")),
+                        ]
+                    )
+                )
 
             elements = []
             elements.append(Paragraph("Informe de Análisis de Vibraciones", title_style))
@@ -2290,12 +2660,7 @@ class MainApp:
                 ["Frecuencia dominante", f"{features_full['dom_freq']:.2f} Hz"],
             ]
             tbl_cover = Table(cover_summary, colWidths=[200, 200])
-            tbl_cover.setStyle(TableStyle([
-                ("BACKGROUND", (0, 0), (-1, -1), colors.white),
-                ("TEXTCOLOR", (0, 0), (-1, -1), colors.black),
-                ("FONTNAME", (0, 0), (-1, 0), 'Helvetica-Bold'),
-                ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
-            ]))
+            _apply_table_style(tbl_cover)
             elements.append(tbl_cover)
             elements.append(PageBreak())
 
@@ -2310,8 +2675,8 @@ class MainApp:
                 _pdf_hide_lf = True
             _pdf_fft_filter_note = f"Filtro visual FFT: oculta < {_pdf_fc:.2f} Hz" if _pdf_hide_lf else "Filtro visual FFT: sin ocultar"
 
-            elements.append(Paragraph("Resumen Ejecutivo", styles['Heading1']))
-            exec_findings_all = findings_pdf[1:] if len(findings_pdf) > 1 else []
+            elements.append(Paragraph("Resumen Ejecutivo", styles['HeadingAccent']))
+            exec_findings_all = list(findings_core_pdf)
             exec_findings = self._select_main_findings(exec_findings_all)
             if not exec_findings:
                 exec_findings = ["Sin anomalias evidentes segun reglas actuales."]
@@ -2403,12 +2768,7 @@ class MainApp:
                 for pf, pa, order in top_peaks:
                     peaks_data.append([f"{pf:.2f}", f"{pa:.3f}", f"{order:.2f}" if order else "-"])
                 tbl_peaks = Table(peaks_data, colWidths=[120, 140, 120])
-                tbl_peaks.setStyle(TableStyle([
-                    ("BACKGROUND", (0, 0), (-1, -1), colors.white),
-                    ("TEXTCOLOR", (0, 0), (-1, -1), colors.black),
-                    ("FONTNAME", (0, 0), (-1, 0), 'Helvetica-Bold'),
-                    ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
-                ]))
+                _apply_table_style(tbl_peaks)
                 elements.append(tbl_peaks)
                 elements.append(Spacer(1, 12))
 
@@ -2419,12 +2779,7 @@ class MainApp:
                 ["Frecuencia dominante", f"{features_full['dom_freq']:.2f} Hz"],
             ]
             table_summary = Table(data_summary, colWidths=[200, 200])
-            table_summary.setStyle(TableStyle([
-                ("BACKGROUND", (0, 0), (-1, -1), colors.white),
-                ("TEXTCOLOR", (0, 0), (-1, -1), colors.black),
-                ("FONTNAME", (0, 0), (-1, 0), 'Helvetica-Bold'),
-                ("GRID", (0, 0), (-1, -1), 0.5, colors.black)
-            ]))
+            _apply_table_style(table_summary)
             elements.append(table_summary)
             elements.append(Spacer(1, 12))
 
@@ -2435,6 +2790,9 @@ class MainApp:
             if img_runup:
                 elements.append(Paragraph("Arranque/Paro - Cascada 3D", styles['Heading2']))
                 elements.append(Image(img_runup, width=400, height=180))
+            if img_orbit:
+                elements.append(Paragraph("Análisis de órbita", styles['Heading2']))
+                elements.append(Image(img_orbit, width=320, height=320))
 
             if aux_imgs:
                 elements.append(Paragraph("Variables auxiliares", styles['Heading2']))
@@ -2448,19 +2806,33 @@ class MainApp:
                             aux_data.append([col, f"{np.mean(vals):.2f}", f"{np.min(vals):.2f}", f"{np.max(vals):.2f}"])
                 if len(aux_data) > 1:
                     aux_table = Table(aux_data, colWidths=[150, 100, 100, 100])
-                    aux_table.setStyle(TableStyle([
-                        ("BACKGROUND", (0, 0), (-1, -1), colors.white),
-                        ("TEXTCOLOR", (0, 0), (-1, -1), colors.black),
-                        ("FONTNAME", (0, 0), (-1, 0), 'Helvetica-Bold'),
-                        ("GRID", (0, 0), (-1, -1), 0.5, colors.black)
-                    ]))
+                    _apply_table_style(aux_table)
                     elements.append(aux_table)
 
             elements.append(Spacer(1, 12))
-            elements.append(Paragraph("Diagnóstico", styles['Heading2']))
-            elements.append(Paragraph(f"El valor RMS calculado es {rms_mm:.3f} mm/s, lo cual corresponde a: {severity_mm}.", styles['Normal']))
-            for item in findings_pdf:
-                elements.append(Paragraph(f"- {item}", styles['Normal']))
+            elements.append(Paragraph("Diagnóstico", styles['SectionHeading']))
+            elements.append(
+                Paragraph(
+                    f"El valor RMS calculado es {rms_mm:.3f} mm/s, lo cual corresponde a: {severity_mm}.",
+                    styles['Normal'],
+                )
+            )
+            if severity_entry_pdf and severity_entry_pdf not in findings_core_pdf:
+                elements.append(Paragraph(severity_entry_pdf, styles['Normal']))
+            diag_items = findings_core_pdf or ["Sin anomalías evidentes según reglas actuales."]
+            bullet_items = [
+                ListItem(Paragraph(text, styles['Normal']), bulletColor=accent_color)
+                for text in diag_items
+            ]
+            elements.append(
+                ListFlowable(
+                    bullet_items,
+                    bulletType='bullet',
+                    bulletColor=accent_color,
+                    start='bulletchar',
+                    leftIndent=16,
+                )
+            )
 
             # Propiedades del equipo (al final)
             try:
@@ -2505,15 +2877,19 @@ class MainApp:
                     elements.append(Spacer(1, 12))
                     elements.append(Paragraph("Propiedades del equipo", styles['Heading2']))
                     tbl_props = Table([["Propiedad", "Valor"]] + props, colWidths=[200, 200])
-                    tbl_props.setStyle(TableStyle([
-                        ("BACKGROUND", (0, 0), (-1, 0), colors.white),
-                        ("FONTNAME", (0, 0), (-1, 0), 'Helvetica-Bold'),
-                        ("TEXTCOLOR", (0, 0), (-1, -1), colors.black),
-                        ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
-                    ]))
+                    _apply_table_style(tbl_props)
                     elements.append(tbl_props)
             except Exception:
                 pass
+
+            if charlotte_catalog_pdf:
+                elements.append(PageBreak())
+                elements.append(Paragraph("Referencia Tabla de Charlotte (Motores eléctricos)", styles['SectionHeading']))
+                charlotte_table = _build_charlotte_reference_table(
+                    charlotte_catalog_pdf, styles, accent_color
+                )
+                if charlotte_table is not None:
+                    elements.append(charlotte_table)
 
             doc.build(elements)
 
@@ -3376,7 +3752,13 @@ class MainApp:
             self._last_tseg = t_seg
             self._last_accseg = sig_seg
             findings_pdf = res.get('diagnosis', [])
-
+            severity_entry_pdf = res.get('diagnosis_summary')
+            findings_core_pdf = list(res.get('diagnosis_findings', []) or [])
+            if not findings_core_pdf and findings_pdf:
+                _, findings_core_pdf = _split_diagnosis(findings_pdf)
+            charlotte_catalog_pdf = list(res.get('charlotte_catalog', []) or [])
+            if not charlotte_catalog_pdf:
+                charlotte_catalog_pdf = [dict(entry) for entry in CHARLOTTE_MOTOR_FAULTS]
 
 
             # Guardar gráficas como imágenes
@@ -3475,8 +3857,60 @@ class MainApp:
             doc = SimpleDocTemplate(pdf_path, pagesize=A4)
 
             styles = getSampleStyleSheet()
+            try:
+                accent_hex = self._accent_hex()
+            except Exception:
+                accent_hex = "#1f77b4"
+            try:
+                accent_color = colors.HexColor(accent_hex)
+            except Exception:
+                accent_color = colors.HexColor("#1f77b4")
+            title_style = ParagraphStyle(
+                "title",
+                parent=styles['Title'],
+                textColor=accent_color,
+                spaceAfter=12,
+            )
+            styles.add(
+                ParagraphStyle(
+                    "HeadingAccent",
+                    parent=styles['Heading1'],
+                    textColor=accent_color,
+                    spaceAfter=8,
+                )
+            )
+            styles.add(
+                ParagraphStyle(
+                    "SectionHeading",
+                    parent=styles['Heading2'],
+                    textColor=accent_color,
+                    spaceBefore=12,
+                    spaceAfter=6,
+                )
+            )
+            styles.add(
+                ParagraphStyle(
+                    "BulletItem",
+                    parent=styles['Normal'],
+                    leftIndent=18,
+                    spaceAfter=4,
+                )
+            )
 
-            title_style = ParagraphStyle("title", parent=styles['Title'], textColor=colors.HexColor(self._accent_hex()))
+            def _apply_table_style(tbl: Table) -> None:
+                tbl.setStyle(
+                    TableStyle(
+                        [
+                            ("BACKGROUND", (0, 0), (-1, 0), accent_color),
+                            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                            ("FONTNAME", (0, 0), (-1, 0), 'Helvetica-Bold'),
+                            ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+                            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.white]),
+                            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                            ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#bdc3c7")),
+                        ]
+                    )
+                )
 
             elements = []
             # Cover page
@@ -3494,12 +3928,7 @@ class MainApp:
                 ["Frecuencia dominante", f"{features_full['dom_freq']:.2f} Hz"],
             ]
             tbl_cover = Table(cover_summary, colWidths=[200, 200])
-            tbl_cover.setStyle(TableStyle([
-                ("BACKGROUND", (0, 0), (-1, -1), colors.white),
-                ("TEXTCOLOR", (0, 0), (-1, -1), colors.black),
-                ("FONTNAME", (0, 0), (-1, 0), 'Helvetica-Bold'),
-                ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
-            ]))
+            _apply_table_style(tbl_cover)
             elements.append(tbl_cover)
             elements.append(PageBreak())
             # Resumen Ejecutivo
@@ -3514,8 +3943,8 @@ class MainApp:
                 _pdf_hide_lf2 = True
             _pdf_fft_filter_note2 = f"Filtro visual FFT: oculta < {_pdf_fc2:.2f} Hz" if _pdf_hide_lf2 else "Filtro visual FFT: sin ocultar"
 
-            elements.append(Paragraph("Resumen Ejecutivo", styles['Heading1']))
-            exec_findings_all2 = findings_pdf[1:] if len(findings_pdf) > 1 else []
+            elements.append(Paragraph("Resumen Ejecutivo", styles['HeadingAccent']))
+            exec_findings_all2 = list(findings_core_pdf)
             exec_findings = self._select_main_findings(exec_findings_all2)
             if not exec_findings:
                 exec_findings = ["Sin anomalias evidentes segun reglas actuales."]
@@ -3524,9 +3953,20 @@ class MainApp:
             elements.append(Paragraph(f"Frecuencia dominante: {features_full['dom_freq']:.2f} Hz", styles['Normal']))
             elements.append(Paragraph(_pdf_fft_filter_note2, styles['Normal']))
             elements.append(Spacer(1, 8))
-            elements.append(Paragraph("Diagnóstico:", styles['Heading2']))
-            for item in exec_findings:
-                elements.append(Paragraph(f"- {item}", styles['Normal']))
+            elements.append(Paragraph("Diagnóstico:", styles['SectionHeading']))
+            exec_bullets = [
+                ListItem(Paragraph(text, styles['Normal']), bulletColor=accent_color)
+                for text in exec_findings
+            ]
+            elements.append(
+                ListFlowable(
+                    exec_bullets,
+                    bulletType='bullet',
+                    bulletColor=accent_color,
+                    start='bulletchar',
+                    leftIndent=16,
+                )
+            )
 
 
             elements.append(Paragraph("📊 Reporte de Análisis de Vibraciones", title_style))
@@ -3544,7 +3984,7 @@ class MainApp:
                 ["Crest factor (aceleracion)", f"{features_full['crest']:.2f}"]
             ]
             table_summary = Table(data_summary, colWidths=[200, 200])
-            elements.append(Paragraph("Metricas detalladas", styles['Heading2']))
+            elements.append(Paragraph("Metricas detalladas", styles['SectionHeading']))
             det = [
                 ["Metrica", "Valor"],
                 ["RMS aceleracion (m/s^2)", f"{features_full['rms_time_acc']:.3e}"],
@@ -3558,20 +3998,10 @@ class MainApp:
                 ["Relacion 3X", f"{features_full['r3x']:.2f}"],
             ]
             tbl_det = Table(det, colWidths=[220, 180])
-            tbl_det.setStyle(TableStyle([
-                ("BACKGROUND", (0, 0), (-1, -1), colors.white),
-                ("TEXTCOLOR", (0, 0), (-1, -1), colors.black),
-                ("FONTNAME", (0, 0), (-1, 0), 'Helvetica-Bold'),
-                ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
-            ]))
+            _apply_table_style(tbl_det)
             elements.append(tbl_det)
             elements.append(Spacer(1, 12))
-            table_summary.setStyle(TableStyle([
-                ("BACKGROUND", (0, 0), (-1, -1), colors.white),
-                ("TEXTCOLOR", (0, 0), (-1, -1), colors.black),
-                ("FONTNAME", (0, 0), (-1, 0), 'Helvetica-Bold'),
-                ("GRID", (0, 0), (-1, -1), 0.5, colors.black)
-            ]))
+            _apply_table_style(table_summary)
             elements.append(table_summary)
             elements.append(Spacer(1, 12))
 
@@ -3597,21 +4027,41 @@ class MainApp:
                         aux_data.append([col, f"{np.mean(vals):.2f}", f"{np.min(vals):.2f}", f"{np.max(vals):.2f}"])
                 if len(aux_data) > 1:
                     aux_table = Table(aux_data, colWidths=[150, 100, 100, 100])
-                    aux_table = Table(aux_data, colWidths=[150, 100, 100, 100])
-                    aux_table.setStyle(TableStyle([
-                        ("BACKGROUND", (0, 0), (-1, -1), colors.white),
-                        ("TEXTCOLOR", (0, 0), (-1, -1), colors.black),
-                        ("FONTNAME", (0, 0), (-1, 0), 'Helvetica-Bold'),
-                        ("GRID", (0, 0), (-1, -1), 0.5, colors.black)
-                    ]))
+                    _apply_table_style(aux_table)
                     elements.append(aux_table)
             elements.append(Spacer(1, 12))
-            elements.append(Paragraph("Diagnóstico", styles['Heading2']))
-            elements.append(Paragraph(f"El valor RMS calculado es {rms_mm:.3f} mm/s, lo cual corresponde a: {severity_mm}.", styles['Normal']))
-            # (line removed: m/s diagnostic)
-            for item in findings_pdf:
-                elements.append(Paragraph(f"- {item}", styles['Normal']))
+            elements.append(Paragraph("Diagnóstico", styles['SectionHeading']))
+            elements.append(
+                Paragraph(
+                    f"El valor RMS calculado es {rms_mm:.3f} mm/s, lo cual corresponde a: {severity_mm}.",
+                    styles['Normal'],
+                )
+            )
+            if severity_entry_pdf and severity_entry_pdf not in findings_core_pdf:
+                elements.append(Paragraph(severity_entry_pdf, styles['Normal']))
+            diag_items = findings_core_pdf or ["Sin anomalías evidentes según reglas actuales."]
+            bullet_items = [
+                ListItem(Paragraph(text, styles['Normal']), bulletColor=accent_color)
+                for text in diag_items
+            ]
+            elements.append(
+                ListFlowable(
+                    bullet_items,
+                    bulletType='bullet',
+                    bulletColor=accent_color,
+                    start='bulletchar',
+                    leftIndent=16,
+                )
+            )
 
+            if charlotte_catalog_pdf:
+                elements.append(PageBreak())
+                elements.append(Paragraph("Referencia Tabla de Charlotte (Motores eléctricos)", styles['SectionHeading']))
+                charlotte_table = _build_charlotte_reference_table(
+                    charlotte_catalog_pdf, styles, accent_color
+                )
+                if charlotte_table is not None:
+                    elements.append(charlotte_table)
 
             doc.build(elements)
 
@@ -3940,11 +4390,56 @@ class MainApp:
         self.hide_lf_cb = ft.Checkbox(label="Ocultar bajas frecuencias", value=True)
         self.lf_cutoff_field = ft.TextField(label="Corte LF (Hz)", value="0.5", width=100)
         self.hf_limit_field = ft.TextField(label="Máx FFT (Hz)", value="", width=120)
+        orbit_options = [ft.dropdown.Option(col) for col in available_signals]
+        default_orbit_x = (
+            self.orbit_axis_x_pref
+            if self.orbit_axis_x_pref in available_signals
+            else (available_signals[0] if available_signals else None)
+        )
+        default_orbit_y = (
+            self.orbit_axis_y_pref
+            if self.orbit_axis_y_pref in available_signals
+            else (
+                available_signals[1]
+                if len(available_signals) > 1
+                else (available_signals[0] if available_signals else None)
+            )
+        )
+        if default_orbit_y == default_orbit_x and len(available_signals) > 1:
+            for candidate in available_signals:
+                if candidate != default_orbit_x:
+                    default_orbit_y = candidate
+                    break
+        self._remember_orbit_axis("x", default_orbit_x)
+        self._remember_orbit_axis("y", default_orbit_y)
         self.runup_3d_cb = ft.Checkbox(
             label="Arranque/paro 3D",
             value=self.runup_3d_enabled,
             tooltip="Agrega cascada 3D para análisis de arranque y paro",
             on_change=self._on_runup_3d_toggle,
+        )
+        orbit_disabled = (not self.orbit_plot_enabled) or (len(available_signals) == 0)
+        self.orbit_cb = ft.Checkbox(
+            label="Análisis de órbita",
+            value=self.orbit_plot_enabled,
+            tooltip="Genera la órbita X-Y del rotor para evaluar restricciones de movimiento",
+            on_change=self._on_orbit_toggle,
+        )
+        self.orbit_x_dd = ft.Dropdown(
+            label="Órbita eje X",
+            options=orbit_options,
+            value=default_orbit_x,
+            width=200,
+            on_change=self._on_orbit_axis_change,
+            disabled=orbit_disabled,
+        )
+        self.orbit_y_dd = ft.Dropdown(
+            label="Órbita eje Y",
+            options=orbit_options,
+            value=default_orbit_y,
+            width=200,
+            on_change=self._on_orbit_axis_change,
+            disabled=orbit_disabled,
         )
         self.fft_zoom_text = ft.Text("Zoom FFT: completo", size=12)
         self.fft_zoom_slider = ft.RangeSlider(
@@ -4046,6 +4541,7 @@ class MainApp:
                 # Opciones de espectro (visual)
                 ft.Text("Opciones de espectro (visual):", size=14),
                 ft.Row([self.hide_lf_cb, self.lf_cutoff_field, self.hf_limit_field, self.runup_3d_cb], spacing=10, wrap=True),
+                ft.Row([self.orbit_cb, self.orbit_x_dd, self.orbit_y_dd], spacing=10, wrap=True),
                 ft.Column([self.fft_zoom_text, self.fft_zoom_slider], spacing=4),
                 ft.Row([self.db_scale_cb, self.sens_unit_dd, self.sensor_sens_field, self.gain_field], spacing=10),
                 ft.Row([self.db_ref_field, self.db_ymin_field, self.db_ymax_field], spacing=10),
@@ -4464,6 +4960,109 @@ class MainApp:
                 for tick in axis.get_ticklabels():
                     tick.set_color(axis_color)
             fig.colorbar(surf, ax=ax, shrink=0.6, pad=0.1, label="Velocidad [mm/s]")
+            fig.tight_layout()
+            return fig
+        except Exception:
+            return None
+
+    def _generate_orbit_figure(
+        self,
+        t_segment: np.ndarray,
+        x_segment: np.ndarray,
+        y_segment: np.ndarray,
+        x_label: str,
+        y_label: str,
+        fc: float,
+        hide_lf: bool,
+        fmax_ui: Optional[float],
+        dark_mode: bool,
+    ):
+        try:
+            t = np.asarray(t_segment, dtype=float).ravel()
+            x = np.asarray(x_segment, dtype=float).ravel()
+            y = np.asarray(y_segment, dtype=float).ravel()
+            if t.size < 32 or x.size != t.size or y.size != t.size:
+                return None
+            valid = np.isfinite(t) & np.isfinite(x) & np.isfinite(y)
+            if np.count_nonzero(valid) < 32:
+                return None
+            t = t[valid]
+            x = x[valid]
+            y = y[valid]
+            dt = None
+            if t.size > 1:
+                try:
+                    dt_val = float(np.median(np.diff(t)))
+                    if np.isfinite(dt_val) and dt_val > 0:
+                        dt = dt_val
+                except Exception:
+                    dt = None
+
+            def _band_filter(arr: np.ndarray) -> np.ndarray:
+                base = np.asarray(arr, dtype=float)
+                base = base - np.nanmean(base)
+                base = np.nan_to_num(base, nan=0.0, posinf=0.0, neginf=0.0)
+                if dt is None or base.size < 32:
+                    return base
+                spec = np.fft.rfft(base)
+                freqs = np.fft.rfftfreq(base.size, dt)
+                if hide_lf and fc and fc > 0:
+                    spec[freqs < max(0.0, float(fc))] = 0
+                if fmax_ui and fmax_ui > 0:
+                    spec[freqs > float(fmax_ui)] = 0
+                try:
+                    filtered = np.fft.irfft(spec, n=base.size)
+                except Exception:
+                    filtered = base
+                return filtered
+
+            x_filt = _band_filter(x)
+            y_filt = _band_filter(y)
+            if x_filt.size > 6000:
+                idx = np.linspace(0, x_filt.size - 1, 3000, dtype=int)
+                x_filt = x_filt[idx]
+                y_filt = y_filt[idx]
+            face = "#0f141b" if dark_mode else "white"
+            fig, ax = plt.subplots(figsize=(6, 6))
+            fig.patch.set_facecolor(face)
+            ax.set_facecolor(face)
+            accent = self._accent_ui()
+            ax.plot(x_filt, y_filt, color=accent, linewidth=1.4, alpha=0.9)
+            progress = np.linspace(0.0, 1.0, x_filt.size)
+            sc = ax.scatter(
+                x_filt,
+                y_filt,
+                c=progress,
+                cmap="plasma",
+                s=10,
+                alpha=0.6,
+                linewidths=0,
+            )
+            try:
+                ax.scatter([x_filt[0]], [y_filt[0]], color="#2ecc71", s=50, label="Inicio")
+                ax.scatter([x_filt[-1]], [y_filt[-1]], color="#e74c3c", s=50, label="Fin")
+                ax.legend(loc="upper right", fontsize=8)
+            except Exception:
+                pass
+            ax.set_title("Análisis de órbita")
+            ax.set_xlabel(x_label or "Canal X")
+            ax.set_ylabel(y_label or "Canal Y")
+            ax.set_aspect("equal", adjustable="datalim")
+            grid_color = "#34495e" if dark_mode else "#bdc3c7"
+            ax.grid(True, linestyle="--", alpha=0.25 if dark_mode else 0.35, color=grid_color)
+            axis_color = "white" if dark_mode else "black"
+            ax.xaxis.label.set_color(axis_color)
+            ax.yaxis.label.set_color(axis_color)
+            ax.title.set_color(axis_color)
+            for axis in [ax.xaxis, ax.yaxis]:
+                for tick in axis.get_ticklabels():
+                    tick.set_color(axis_color)
+            cbar = fig.colorbar(sc, ax=ax, shrink=0.8, pad=0.015)
+            cbar.set_label("Progreso temporal")
+            if dark_mode:
+                cbar.ax.yaxis.label.set_color("white")
+                for tick in cbar.ax.get_yticklabels():
+                    tick.set_color("white")
             fig.tight_layout()
             return fig
         except Exception:
@@ -5158,7 +5757,11 @@ class MainApp:
             rms_mm = res['severity']['rms_mm_s']
             severity_label_ms = res['severity']['label']
             severity_color_ms = res['severity']['color']
-            findings = res['diagnosis']
+            raw_findings = res.get('diagnosis', [])
+            findings_core = list(res.get('diagnosis_findings', []) or [])
+            if not findings_core and raw_findings:
+                _, findings_core = _split_diagnosis(raw_findings)
+            findings = findings_core
             # Explicación y revisiones sugeridas (basado en hallazgos y métricas)
             exp_lines = []
             # Reducir hallazgos a los principales (para explicaciones)
@@ -5537,6 +6140,40 @@ class MainApp:
             except Exception:
                 env_chart = None
 
+            orbit_chart = None
+            try:
+                orbit_enabled = False
+                if getattr(self, 'orbit_cb', None):
+                    orbit_enabled = bool(getattr(self.orbit_cb, 'value', False))
+                else:
+                    orbit_enabled = bool(getattr(self, 'orbit_plot_enabled', False))
+                if orbit_enabled:
+                    x_col = getattr(self, 'orbit_x_dd', None).value if getattr(self, 'orbit_x_dd', None) else self.orbit_axis_x_pref
+                    y_col = getattr(self, 'orbit_y_dd', None).value if getattr(self, 'orbit_y_dd', None) else self.orbit_axis_y_pref
+                    if x_col and y_col and x_col in self.current_df.columns and y_col in self.current_df.columns:
+                        try:
+                            x_seg = self.current_df.loc[mask, x_col].to_numpy()
+                            y_seg = self.current_df.loc[mask, y_col].to_numpy()
+                        except Exception:
+                            x_seg = self.current_df[x_col].to_numpy()
+                            y_seg = self.current_df[y_col].to_numpy()
+                        orbit_fig = self._generate_orbit_figure(
+                            t_segment,
+                            x_seg,
+                            y_seg,
+                            x_col,
+                            y_col,
+                            fc,
+                            hide_lf,
+                            fmax_ui,
+                            self.is_dark_mode,
+                        )
+                        if orbit_fig is not None:
+                            orbit_chart = MatplotlibChart(orbit_fig, expand=True, isolated=True)
+                            plt.close(orbit_fig)
+            except Exception:
+                orbit_chart = None
+
             runup_chart = None
             try:
                 if getattr(self, 'runup_3d_cb', None) and getattr(self.runup_3d_cb, 'value', False):
@@ -5597,12 +6234,7 @@ class MainApp:
                 sev_label, sev_color = severity_label_ms, severity_color_ms
             except Exception:
                 sev_label, sev_color = "N/D", "#7f8c8d"
-            exec_findings = findings[1:] if len(findings) > 1 else ["Sin anomalías evidentes según reglas actuales."]
-            # Filtrar a hallazgos principales
-            try:
-                exec_findings_all = list(exec_findings)
-            except Exception:
-                exec_findings_all = exec_findings if isinstance(exec_findings, list) else []
+            exec_findings_all = list(findings)
             exec_findings = self._select_main_findings(exec_findings_all)
             if not exec_findings:
                 exec_findings = ["Sin anomalías evidentes según reglas actuales."]
@@ -5700,6 +6332,7 @@ class MainApp:
                     chart
                 ]
                     + ([runup_chart] if runup_chart else [])
+                    + ([orbit_chart] if orbit_chart else [])
                     + ([env_chart] if 'env_chart' in locals() and env_chart else [])
                     + aux_plots,
                 spacing=20,
@@ -7013,6 +7646,59 @@ class MainApp:
             self.page.client_storage.set("runup_3d_enabled", self.runup_3d_enabled)
         except Exception:
             pass
+        self._update_analysis()
+
+
+    def _refresh_orbit_inputs(self):
+        ctrl_x = getattr(self, 'orbit_x_dd', None)
+        ctrl_y = getattr(self, 'orbit_y_dd', None)
+        try:
+            enabled = bool(getattr(self, 'orbit_cb', None).value)
+        except Exception:
+            enabled = bool(getattr(self, 'orbit_plot_enabled', False))
+        try:
+            options_available = bool(getattr(ctrl_x, 'options', []) or getattr(ctrl_y, 'options', []))
+            if isinstance(getattr(ctrl_x, 'options', None), list):
+                options_available = options_available and len(ctrl_x.options) > 0
+            if isinstance(getattr(ctrl_y, 'options', None), list):
+                options_available = options_available and len(ctrl_y.options) > 0
+        except Exception:
+            options_available = False
+        disabled = (not enabled) or (not options_available)
+        for ctrl in (ctrl_x, ctrl_y):
+            if ctrl is None:
+                continue
+            try:
+                ctrl.disabled = disabled
+                if ctrl.page:
+                    ctrl.update()
+            except Exception:
+                continue
+
+    def _on_orbit_toggle(self, e=None):
+        try:
+            enabled = bool(getattr(self, 'orbit_cb', None).value)
+        except Exception:
+            enabled = False
+        self.orbit_plot_enabled = enabled
+        try:
+            self.page.client_storage.set("orbit_plot_enabled", self.orbit_plot_enabled)
+        except Exception:
+            pass
+        self._refresh_orbit_inputs()
+        self._update_analysis()
+
+    def _on_orbit_axis_change(self, e=None):
+        ctrl = getattr(e, 'control', None) if e else None
+        value = getattr(ctrl, 'value', None) if ctrl else None
+        if ctrl is getattr(self, 'orbit_x_dd', None):
+            self._remember_orbit_axis('x', value if value else None)
+        elif ctrl is getattr(self, 'orbit_y_dd', None):
+            self._remember_orbit_axis('y', value if value else None)
+        else:
+            return
+        if self.orbit_cb and not getattr(self.orbit_cb, 'value', False):
+            return
         self._update_analysis()
 
 

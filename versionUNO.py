@@ -27,6 +27,124 @@ import shutil
 
 APP_VERSION = "v1.0.0"
 
+# Conjunto de fallas consideradas en la Tabla de Charlotte para motores eléctricos.
+# Cada entrada incluye un identificador, el nombre de la falla y una descripción breve
+# para contextualizar al usuario durante la interpretación del diagnóstico automático.
+CHARLOTTE_MOTOR_FAULTS: List[Dict[str, str]] = [
+    {
+        "code": "EM01",
+        "name": "Desbalanceo del rotor",
+        "description": "Vibración 1X dominante en dirección radial; aumenta con las RPM.",
+    },
+    {
+        "code": "EM02",
+        "name": "Desalineación angular",
+        "description": "Elevación de 2X y 3X, con componentes axiales pronunciados.",
+    },
+    {
+        "code": "EM03",
+        "name": "Desalineación paralela",
+        "description": "Componentes 1X y 2X en dirección radial y axial con desfase entre soportes.",
+    },
+    {
+        "code": "EM04",
+        "name": "Holgura mecánica",
+        "description": "Multiplicidad de armónicos de 1X y presencia de impactos o subarmónicos.",
+    },
+    {
+        "code": "EM05",
+        "name": "Holgura estructural / base suelta",
+        "description": "Respuesta amplia entre 1X y 3X acompañada de modulación irregular.",
+    },
+    {
+        "code": "EM06",
+        "name": "Resonancia estructural",
+        "description": "Picos muy agudos con factor Q alto y sensibilidad extrema a pequeños cambios.",
+    },
+    {
+        "code": "EM07",
+        "name": "Soft foot (pata coja)",
+        "description": "Variaciones de fase/1X durante el apriete de pernos y fuerte componente axial.",
+    },
+    {
+        "code": "EM08",
+        "name": "Eje doblado",
+        "description": "1X dominante con fuertes componentes axiales y segundo armónico moderado.",
+    },
+    {
+        "code": "EM09",
+        "name": "Rotor excéntrico",
+        "description": "1X radial elevado acompañado de bandas laterales sincronizadas con RPM.",
+    },
+    {
+        "code": "EM10",
+        "name": "Barras de rotor rotas",
+        "description": "Bandas laterales alrededor de 1X y 2X, modulación a frecuencia de resbalamiento.",
+    },
+    {
+        "code": "EM11",
+        "name": "Rotor flojo / roce de rotor",
+        "description": "Vibración subsíncrona, impactos y crecimiento de armónicos impares.",
+    },
+    {
+        "code": "EM12",
+        "name": "Problemas eléctricos del estator",
+        "description": "Componentes a 2X línea y picos a 1X línea +/- 1X mecánico.",
+    },
+    {
+        "code": "EM13",
+        "name": "Desequilibrio de tensión / armónicos de línea",
+        "description": "Elevación persistente de 2X y 3X de línea y modulación armónica.",
+    },
+    {
+        "code": "EM14",
+        "name": "Rodamiento - pista externa",
+        "description": "Frecuencias BPFO y sus armónicos con posibles bandas laterales a 1X.",
+    },
+    {
+        "code": "EM15",
+        "name": "Rodamiento - pista interna",
+        "description": "Frecuencias BPFI dominantes y modulación con 1X o frecuencia de rotación.",
+    },
+    {
+        "code": "EM16",
+        "name": "Rodamiento - elemento rodante",
+        "description": "BSF y sus armónicos con envolvente rica en alta frecuencia.",
+    },
+    {
+        "code": "EM17",
+        "name": "Rodamiento - jaula / separador",
+        "description": "FTF y subarmónicos, a menudo acompañados de impulsos repetitivos.",
+    },
+    {
+        "code": "EM18",
+        "name": "Lubricación deficiente o contaminación",
+        "description": "Crecimiento amplio en alta frecuencia y elevación del ruido de fondo.",
+    },
+    {
+        "code": "EM19",
+        "name": "Problemas en acoplamiento",
+        "description": "Combinación de armónicos 1X-3X y variaciones según la carga transmitida.",
+    },
+    {
+        "code": "EM20",
+        "name": "Ventilador o elementos auxiliares",
+        "description": "Picos a frecuencias de aspas/paletas y subarmónicos modulados.",
+    },
+]
+
+
+def _charlotte_faults_lines() -> List[str]:
+    """Devuelve las descripciones formateadas de las fallas Charlotte para motores."""
+    lines: List[str] = []
+    for entry in CHARLOTTE_MOTOR_FAULTS:
+        code = entry.get("code", "-")
+        name = entry.get("name", "Falla")
+        desc = entry.get("description", "")
+        formatted = f"• {code} – {name}: {desc}"
+        lines.append(formatted)
+    return lines
+
 # =========================
 #   Utilidades de rodamientos (frecuencias teóricas)
 # =========================
@@ -590,6 +708,9 @@ def analyze_vibration(
         pass
     if len(findings) == 1:
         findings.append("Sin anomalías evidentes según reglas actuales.")
+
+    findings.append("Posibles fallas según Tabla de Charlotte (Motores eléctricos):")
+    findings.extend(_charlotte_faults_lines())
     return {
         "segment_used": (float(t[0]), float(t[-1])),
         "fs_hz": fs,
@@ -4797,6 +4918,9 @@ class MainApp:
 
         if len(findings) == 1:
             findings.append("Sin anomalías evidentes según reglas actuales.")
+
+        findings.append("Posibles fallas según Tabla de Charlotte (Motores eléctricos):")
+        findings.extend(_charlotte_faults_lines())
 
         return findings
 
