@@ -20,7 +20,17 @@ from typing import Optional, Tuple, Dict, Any, List
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  # Needed for 3D projections
 # --- PDF reportlab imports ---
 from reportlab.lib.pagesizes import A4
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle, PageBreak
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Paragraph,
+    Spacer,
+    Image,
+    Table,
+    TableStyle,
+    PageBreak,
+    ListFlowable,
+    ListItem,
+)
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 import tempfile
@@ -145,6 +155,21 @@ def _charlotte_faults_lines() -> List[str]:
         formatted = f"• {code} – {name}: {desc}"
         lines.append(formatted)
     return lines
+
+
+def _split_diagnosis(findings: Optional[List[str]]) -> Tuple[Optional[str], List[str]]:
+    """Separa la entrada de severidad ISO del resto de hallazgos."""
+    severity: Optional[str] = None
+    core: List[str] = []
+    if not findings:
+        return severity, core
+    for item in findings:
+        text = str(item)
+        if severity is None and text.lower().startswith("severidad iso"):
+            severity = text
+            continue
+        core.append(text)
+    return severity, core
 
 # =========================
 #   Utilidades de rodamientos (frecuencias teóricas)
@@ -709,9 +734,7 @@ def analyze_vibration(
         pass
     if len(findings) == 1:
         findings.append("Sin anomalías evidentes según reglas actuales.")
-
-    findings.append("Posibles fallas según Tabla de Charlotte (Motores eléctricos):")
-    findings.extend(_charlotte_faults_lines())
+    severity_summary, core_findings = _split_diagnosis(findings)
     return {
         "segment_used": (float(t[0]), float(t[-1])),
         "fs_hz": fs,
@@ -746,6 +769,10 @@ def analyze_vibration(
         "f1_hz": f1,
         "severity": {"label": sev_label, "color": sev_color, "rms_mm_s": rms_vel_spec_mm},
         "diagnosis": findings,
+        "diagnosis_summary": severity_summary,
+        "diagnosis_findings": core_findings,
+        "charlotte_catalog": [dict(entry) for entry in CHARLOTTE_MOTOR_FAULTS],
+        "charlotte_lines": _charlotte_faults_lines(),
     }
 
 
@@ -2149,6 +2176,13 @@ class MainApp:
             self._last_tseg = t_seg
             self._last_accseg = sig_seg
             findings_pdf = res.get('diagnosis', [])
+            severity_entry_pdf = res.get('diagnosis_summary')
+            findings_core_pdf = list(res.get('diagnosis_findings', []) or [])
+            if not findings_core_pdf and findings_pdf:
+                _, findings_core_pdf = _split_diagnosis(findings_pdf)
+            charlotte_catalog_pdf = list(res.get('charlotte_catalog', []) or [])
+            if not charlotte_catalog_pdf:
+                charlotte_catalog_pdf = [dict(entry) for entry in CHARLOTTE_MOTOR_FAULTS]
 
             tmp_imgs = []
             def save_plot(fig):
@@ -2452,7 +2486,60 @@ class MainApp:
 
             doc = SimpleDocTemplate(pdf_path, pagesize=A4)
             styles = getSampleStyleSheet()
-            title_style = ParagraphStyle("title", parent=styles['Title'], textColor=colors.HexColor(self._accent_hex()))
+            try:
+                accent_hex = self._accent_hex()
+            except Exception:
+                accent_hex = "#1f77b4"
+            try:
+                accent_color = colors.HexColor(accent_hex)
+            except Exception:
+                accent_color = colors.HexColor("#1f77b4")
+            title_style = ParagraphStyle(
+                "title",
+                parent=styles['Title'],
+                textColor=accent_color,
+                spaceAfter=12,
+            )
+            styles.add(
+                ParagraphStyle(
+                    "HeadingAccent",
+                    parent=styles['Heading1'],
+                    textColor=accent_color,
+                    spaceAfter=8,
+                )
+            )
+            styles.add(
+                ParagraphStyle(
+                    "SectionHeading",
+                    parent=styles['Heading2'],
+                    textColor=accent_color,
+                    spaceBefore=12,
+                    spaceAfter=6,
+                )
+            )
+            styles.add(
+                ParagraphStyle(
+                    "BulletItem",
+                    parent=styles['Normal'],
+                    leftIndent=18,
+                    spaceAfter=4,
+                )
+            )
+
+            def _apply_table_style(tbl: Table) -> None:
+                tbl.setStyle(
+                    TableStyle(
+                        [
+                            ("BACKGROUND", (0, 0), (-1, 0), accent_color),
+                            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                            ("FONTNAME", (0, 0), (-1, 0), 'Helvetica-Bold'),
+                            ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+                            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.white]),
+                            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                            ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#bdc3c7")),
+                        ]
+                    )
+                )
 
             elements = []
             elements.append(Paragraph("Informe de Análisis de Vibraciones", title_style))
@@ -2470,12 +2557,7 @@ class MainApp:
                 ["Frecuencia dominante", f"{features_full['dom_freq']:.2f} Hz"],
             ]
             tbl_cover = Table(cover_summary, colWidths=[200, 200])
-            tbl_cover.setStyle(TableStyle([
-                ("BACKGROUND", (0, 0), (-1, -1), colors.white),
-                ("TEXTCOLOR", (0, 0), (-1, -1), colors.black),
-                ("FONTNAME", (0, 0), (-1, 0), 'Helvetica-Bold'),
-                ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
-            ]))
+            _apply_table_style(tbl_cover)
             elements.append(tbl_cover)
             elements.append(PageBreak())
 
@@ -2490,8 +2572,8 @@ class MainApp:
                 _pdf_hide_lf = True
             _pdf_fft_filter_note = f"Filtro visual FFT: oculta < {_pdf_fc:.2f} Hz" if _pdf_hide_lf else "Filtro visual FFT: sin ocultar"
 
-            elements.append(Paragraph("Resumen Ejecutivo", styles['Heading1']))
-            exec_findings_all = findings_pdf[1:] if len(findings_pdf) > 1 else []
+            elements.append(Paragraph("Resumen Ejecutivo", styles['HeadingAccent']))
+            exec_findings_all = list(findings_core_pdf)
             exec_findings = self._select_main_findings(exec_findings_all)
             if not exec_findings:
                 exec_findings = ["Sin anomalias evidentes segun reglas actuales."]
@@ -2583,12 +2665,7 @@ class MainApp:
                 for pf, pa, order in top_peaks:
                     peaks_data.append([f"{pf:.2f}", f"{pa:.3f}", f"{order:.2f}" if order else "-"])
                 tbl_peaks = Table(peaks_data, colWidths=[120, 140, 120])
-                tbl_peaks.setStyle(TableStyle([
-                    ("BACKGROUND", (0, 0), (-1, -1), colors.white),
-                    ("TEXTCOLOR", (0, 0), (-1, -1), colors.black),
-                    ("FONTNAME", (0, 0), (-1, 0), 'Helvetica-Bold'),
-                    ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
-                ]))
+                _apply_table_style(tbl_peaks)
                 elements.append(tbl_peaks)
                 elements.append(Spacer(1, 12))
 
@@ -2599,12 +2676,7 @@ class MainApp:
                 ["Frecuencia dominante", f"{features_full['dom_freq']:.2f} Hz"],
             ]
             table_summary = Table(data_summary, colWidths=[200, 200])
-            table_summary.setStyle(TableStyle([
-                ("BACKGROUND", (0, 0), (-1, -1), colors.white),
-                ("TEXTCOLOR", (0, 0), (-1, -1), colors.black),
-                ("FONTNAME", (0, 0), (-1, 0), 'Helvetica-Bold'),
-                ("GRID", (0, 0), (-1, -1), 0.5, colors.black)
-            ]))
+            _apply_table_style(table_summary)
             elements.append(table_summary)
             elements.append(Spacer(1, 12))
 
@@ -2631,19 +2703,33 @@ class MainApp:
                             aux_data.append([col, f"{np.mean(vals):.2f}", f"{np.min(vals):.2f}", f"{np.max(vals):.2f}"])
                 if len(aux_data) > 1:
                     aux_table = Table(aux_data, colWidths=[150, 100, 100, 100])
-                    aux_table.setStyle(TableStyle([
-                        ("BACKGROUND", (0, 0), (-1, -1), colors.white),
-                        ("TEXTCOLOR", (0, 0), (-1, -1), colors.black),
-                        ("FONTNAME", (0, 0), (-1, 0), 'Helvetica-Bold'),
-                        ("GRID", (0, 0), (-1, -1), 0.5, colors.black)
-                    ]))
+                    _apply_table_style(aux_table)
                     elements.append(aux_table)
 
             elements.append(Spacer(1, 12))
-            elements.append(Paragraph("Diagnóstico", styles['Heading2']))
-            elements.append(Paragraph(f"El valor RMS calculado es {rms_mm:.3f} mm/s, lo cual corresponde a: {severity_mm}.", styles['Normal']))
-            for item in findings_pdf:
-                elements.append(Paragraph(f"- {item}", styles['Normal']))
+            elements.append(Paragraph("Diagnóstico", styles['SectionHeading']))
+            elements.append(
+                Paragraph(
+                    f"El valor RMS calculado es {rms_mm:.3f} mm/s, lo cual corresponde a: {severity_mm}.",
+                    styles['Normal'],
+                )
+            )
+            if severity_entry_pdf and severity_entry_pdf not in findings_core_pdf:
+                elements.append(Paragraph(severity_entry_pdf, styles['Normal']))
+            diag_items = findings_core_pdf or ["Sin anomalías evidentes según reglas actuales."]
+            bullet_items = [
+                ListItem(Paragraph(text, styles['Normal']), bulletColor=accent_color)
+                for text in diag_items
+            ]
+            elements.append(
+                ListFlowable(
+                    bullet_items,
+                    bulletType='bullet',
+                    bulletColor=accent_color,
+                    start='bulletchar',
+                    leftIndent=16,
+                )
+            )
 
             # Propiedades del equipo (al final)
             try:
@@ -2688,15 +2774,35 @@ class MainApp:
                     elements.append(Spacer(1, 12))
                     elements.append(Paragraph("Propiedades del equipo", styles['Heading2']))
                     tbl_props = Table([["Propiedad", "Valor"]] + props, colWidths=[200, 200])
-                    tbl_props.setStyle(TableStyle([
-                        ("BACKGROUND", (0, 0), (-1, 0), colors.white),
-                        ("FONTNAME", (0, 0), (-1, 0), 'Helvetica-Bold'),
-                        ("TEXTCOLOR", (0, 0), (-1, -1), colors.black),
-                        ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
-                    ]))
+                    _apply_table_style(tbl_props)
                     elements.append(tbl_props)
             except Exception:
                 pass
+
+            if charlotte_catalog_pdf:
+                elements.append(PageBreak())
+                elements.append(Paragraph("Referencia Tabla de Charlotte (Motores eléctricos)", styles['SectionHeading']))
+                charlotte_rows = [["Código", "Falla", "Descripción"]]
+                for entry in charlotte_catalog_pdf:
+                    code = str(entry.get('code', '-'))
+                    name = str(entry.get('name', ''))
+                    desc = str(entry.get('description', ''))
+                    charlotte_rows.append([code, name, desc])
+                charlotte_table = Table(charlotte_rows, colWidths=[70, 160, 270])
+                charlotte_table.setStyle(
+                    TableStyle(
+                        [
+                            ("BACKGROUND", (0, 0), (-1, 0), accent_color),
+                            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                            ("FONTNAME", (0, 0), (-1, 0), 'Helvetica-Bold'),
+                            ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+                            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.white]),
+                            ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#bdc3c7")),
+                        ]
+                    )
+                )
+                elements.append(charlotte_table)
 
             doc.build(elements)
 
@@ -3559,7 +3665,13 @@ class MainApp:
             self._last_tseg = t_seg
             self._last_accseg = sig_seg
             findings_pdf = res.get('diagnosis', [])
-
+            severity_entry_pdf = res.get('diagnosis_summary')
+            findings_core_pdf = list(res.get('diagnosis_findings', []) or [])
+            if not findings_core_pdf and findings_pdf:
+                _, findings_core_pdf = _split_diagnosis(findings_pdf)
+            charlotte_catalog_pdf = list(res.get('charlotte_catalog', []) or [])
+            if not charlotte_catalog_pdf:
+                charlotte_catalog_pdf = [dict(entry) for entry in CHARLOTTE_MOTOR_FAULTS]
 
 
             # Guardar gráficas como imágenes
@@ -3658,8 +3770,60 @@ class MainApp:
             doc = SimpleDocTemplate(pdf_path, pagesize=A4)
 
             styles = getSampleStyleSheet()
+            try:
+                accent_hex = self._accent_hex()
+            except Exception:
+                accent_hex = "#1f77b4"
+            try:
+                accent_color = colors.HexColor(accent_hex)
+            except Exception:
+                accent_color = colors.HexColor("#1f77b4")
+            title_style = ParagraphStyle(
+                "title",
+                parent=styles['Title'],
+                textColor=accent_color,
+                spaceAfter=12,
+            )
+            styles.add(
+                ParagraphStyle(
+                    "HeadingAccent",
+                    parent=styles['Heading1'],
+                    textColor=accent_color,
+                    spaceAfter=8,
+                )
+            )
+            styles.add(
+                ParagraphStyle(
+                    "SectionHeading",
+                    parent=styles['Heading2'],
+                    textColor=accent_color,
+                    spaceBefore=12,
+                    spaceAfter=6,
+                )
+            )
+            styles.add(
+                ParagraphStyle(
+                    "BulletItem",
+                    parent=styles['Normal'],
+                    leftIndent=18,
+                    spaceAfter=4,
+                )
+            )
 
-            title_style = ParagraphStyle("title", parent=styles['Title'], textColor=colors.HexColor(self._accent_hex()))
+            def _apply_table_style(tbl: Table) -> None:
+                tbl.setStyle(
+                    TableStyle(
+                        [
+                            ("BACKGROUND", (0, 0), (-1, 0), accent_color),
+                            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                            ("FONTNAME", (0, 0), (-1, 0), 'Helvetica-Bold'),
+                            ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+                            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.white]),
+                            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                            ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#bdc3c7")),
+                        ]
+                    )
+                )
 
             elements = []
             # Cover page
@@ -3677,12 +3841,7 @@ class MainApp:
                 ["Frecuencia dominante", f"{features_full['dom_freq']:.2f} Hz"],
             ]
             tbl_cover = Table(cover_summary, colWidths=[200, 200])
-            tbl_cover.setStyle(TableStyle([
-                ("BACKGROUND", (0, 0), (-1, -1), colors.white),
-                ("TEXTCOLOR", (0, 0), (-1, -1), colors.black),
-                ("FONTNAME", (0, 0), (-1, 0), 'Helvetica-Bold'),
-                ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
-            ]))
+            _apply_table_style(tbl_cover)
             elements.append(tbl_cover)
             elements.append(PageBreak())
             # Resumen Ejecutivo
@@ -3697,8 +3856,8 @@ class MainApp:
                 _pdf_hide_lf2 = True
             _pdf_fft_filter_note2 = f"Filtro visual FFT: oculta < {_pdf_fc2:.2f} Hz" if _pdf_hide_lf2 else "Filtro visual FFT: sin ocultar"
 
-            elements.append(Paragraph("Resumen Ejecutivo", styles['Heading1']))
-            exec_findings_all2 = findings_pdf[1:] if len(findings_pdf) > 1 else []
+            elements.append(Paragraph("Resumen Ejecutivo", styles['HeadingAccent']))
+            exec_findings_all2 = list(findings_core_pdf)
             exec_findings = self._select_main_findings(exec_findings_all2)
             if not exec_findings:
                 exec_findings = ["Sin anomalias evidentes segun reglas actuales."]
@@ -3707,9 +3866,20 @@ class MainApp:
             elements.append(Paragraph(f"Frecuencia dominante: {features_full['dom_freq']:.2f} Hz", styles['Normal']))
             elements.append(Paragraph(_pdf_fft_filter_note2, styles['Normal']))
             elements.append(Spacer(1, 8))
-            elements.append(Paragraph("Diagnóstico:", styles['Heading2']))
-            for item in exec_findings:
-                elements.append(Paragraph(f"- {item}", styles['Normal']))
+            elements.append(Paragraph("Diagnóstico:", styles['SectionHeading']))
+            exec_bullets = [
+                ListItem(Paragraph(text, styles['Normal']), bulletColor=accent_color)
+                for text in exec_findings
+            ]
+            elements.append(
+                ListFlowable(
+                    exec_bullets,
+                    bulletType='bullet',
+                    bulletColor=accent_color,
+                    start='bulletchar',
+                    leftIndent=16,
+                )
+            )
 
 
             elements.append(Paragraph("📊 Reporte de Análisis de Vibraciones", title_style))
@@ -3727,7 +3897,7 @@ class MainApp:
                 ["Crest factor (aceleracion)", f"{features_full['crest']:.2f}"]
             ]
             table_summary = Table(data_summary, colWidths=[200, 200])
-            elements.append(Paragraph("Metricas detalladas", styles['Heading2']))
+            elements.append(Paragraph("Metricas detalladas", styles['SectionHeading']))
             det = [
                 ["Metrica", "Valor"],
                 ["RMS aceleracion (m/s^2)", f"{features_full['rms_time_acc']:.3e}"],
@@ -3741,20 +3911,10 @@ class MainApp:
                 ["Relacion 3X", f"{features_full['r3x']:.2f}"],
             ]
             tbl_det = Table(det, colWidths=[220, 180])
-            tbl_det.setStyle(TableStyle([
-                ("BACKGROUND", (0, 0), (-1, -1), colors.white),
-                ("TEXTCOLOR", (0, 0), (-1, -1), colors.black),
-                ("FONTNAME", (0, 0), (-1, 0), 'Helvetica-Bold'),
-                ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
-            ]))
+            _apply_table_style(tbl_det)
             elements.append(tbl_det)
             elements.append(Spacer(1, 12))
-            table_summary.setStyle(TableStyle([
-                ("BACKGROUND", (0, 0), (-1, -1), colors.white),
-                ("TEXTCOLOR", (0, 0), (-1, -1), colors.black),
-                ("FONTNAME", (0, 0), (-1, 0), 'Helvetica-Bold'),
-                ("GRID", (0, 0), (-1, -1), 0.5, colors.black)
-            ]))
+            _apply_table_style(table_summary)
             elements.append(table_summary)
             elements.append(Spacer(1, 12))
 
@@ -3780,21 +3940,57 @@ class MainApp:
                         aux_data.append([col, f"{np.mean(vals):.2f}", f"{np.min(vals):.2f}", f"{np.max(vals):.2f}"])
                 if len(aux_data) > 1:
                     aux_table = Table(aux_data, colWidths=[150, 100, 100, 100])
-                    aux_table = Table(aux_data, colWidths=[150, 100, 100, 100])
-                    aux_table.setStyle(TableStyle([
-                        ("BACKGROUND", (0, 0), (-1, -1), colors.white),
-                        ("TEXTCOLOR", (0, 0), (-1, -1), colors.black),
-                        ("FONTNAME", (0, 0), (-1, 0), 'Helvetica-Bold'),
-                        ("GRID", (0, 0), (-1, -1), 0.5, colors.black)
-                    ]))
+                    _apply_table_style(aux_table)
                     elements.append(aux_table)
             elements.append(Spacer(1, 12))
-            elements.append(Paragraph("Diagnóstico", styles['Heading2']))
-            elements.append(Paragraph(f"El valor RMS calculado es {rms_mm:.3f} mm/s, lo cual corresponde a: {severity_mm}.", styles['Normal']))
-            # (line removed: m/s diagnostic)
-            for item in findings_pdf:
-                elements.append(Paragraph(f"- {item}", styles['Normal']))
+            elements.append(Paragraph("Diagnóstico", styles['SectionHeading']))
+            elements.append(
+                Paragraph(
+                    f"El valor RMS calculado es {rms_mm:.3f} mm/s, lo cual corresponde a: {severity_mm}.",
+                    styles['Normal'],
+                )
+            )
+            if severity_entry_pdf and severity_entry_pdf not in findings_core_pdf:
+                elements.append(Paragraph(severity_entry_pdf, styles['Normal']))
+            diag_items = findings_core_pdf or ["Sin anomalías evidentes según reglas actuales."]
+            bullet_items = [
+                ListItem(Paragraph(text, styles['Normal']), bulletColor=accent_color)
+                for text in diag_items
+            ]
+            elements.append(
+                ListFlowable(
+                    bullet_items,
+                    bulletType='bullet',
+                    bulletColor=accent_color,
+                    start='bulletchar',
+                    leftIndent=16,
+                )
+            )
 
+            if charlotte_catalog_pdf:
+                elements.append(PageBreak())
+                elements.append(Paragraph("Referencia Tabla de Charlotte (Motores eléctricos)", styles['SectionHeading']))
+                charlotte_rows = [["Código", "Falla", "Descripción"]]
+                for entry in charlotte_catalog_pdf:
+                    code = str(entry.get('code', '-'))
+                    name = str(entry.get('name', ''))
+                    desc = str(entry.get('description', ''))
+                    charlotte_rows.append([code, name, desc])
+                charlotte_table = Table(charlotte_rows, colWidths=[70, 160, 270])
+                charlotte_table.setStyle(
+                    TableStyle(
+                        [
+                            ("BACKGROUND", (0, 0), (-1, 0), accent_color),
+                            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                            ("FONTNAME", (0, 0), (-1, 0), 'Helvetica-Bold'),
+                            ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+                            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.white]),
+                            ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#bdc3c7")),
+                        ]
+                    )
+                )
+                elements.append(charlotte_table)
 
             doc.build(elements)
 
@@ -5356,9 +5552,6 @@ class MainApp:
         if len(findings) == 1:
             findings.append("Sin anomalías evidentes según reglas actuales.")
 
-        findings.append("Posibles fallas según Tabla de Charlotte (Motores eléctricos):")
-        findings.extend(_charlotte_faults_lines())
-
         return findings
 
 
@@ -5493,7 +5686,11 @@ class MainApp:
             rms_mm = res['severity']['rms_mm_s']
             severity_label_ms = res['severity']['label']
             severity_color_ms = res['severity']['color']
-            findings = res['diagnosis']
+            raw_findings = res.get('diagnosis', [])
+            findings_core = list(res.get('diagnosis_findings', []) or [])
+            if not findings_core and raw_findings:
+                _, findings_core = _split_diagnosis(raw_findings)
+            findings = findings_core
             # Explicación y revisiones sugeridas (basado en hallazgos y métricas)
             exp_lines = []
             # Reducir hallazgos a los principales (para explicaciones)
@@ -5966,12 +6163,7 @@ class MainApp:
                 sev_label, sev_color = severity_label_ms, severity_color_ms
             except Exception:
                 sev_label, sev_color = "N/D", "#7f8c8d"
-            exec_findings = findings[1:] if len(findings) > 1 else ["Sin anomalías evidentes según reglas actuales."]
-            # Filtrar a hallazgos principales
-            try:
-                exec_findings_all = list(exec_findings)
-            except Exception:
-                exec_findings_all = exec_findings if isinstance(exec_findings, list) else []
+            exec_findings_all = list(findings)
             exec_findings = self._select_main_findings(exec_findings_all)
             if not exec_findings:
                 exec_findings = ["Sin anomalías evidentes según reglas actuales."]
