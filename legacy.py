@@ -955,6 +955,11 @@ class MainApp:
         self.data_show_favs_only = self._get_bool_storage("data_favs_only", False)
         # Preferencias de análisis avanzados
         self.runup_3d_enabled = self._get_bool_storage("runup_3d_enabled", False)
+        self.orbit_plot_enabled = self._get_bool_storage("orbit_plot_enabled", False)
+        stored_orbit_x = self.page.client_storage.get("orbit_axis_x")
+        stored_orbit_y = self.page.client_storage.get("orbit_axis_y")
+        self.orbit_axis_x_pref = stored_orbit_x if isinstance(stored_orbit_x, str) else None
+        self.orbit_axis_y_pref = stored_orbit_y if isinstance(stored_orbit_y, str) else None
 
 
 
@@ -1815,6 +1820,27 @@ class MainApp:
             stored = None
         return self._sanitize_color(stored, default)
 
+    def _remember_orbit_axis(self, axis: str, value: Optional[str]):
+        key = "orbit_axis_x" if str(axis).lower().startswith("x") else "orbit_axis_y"
+        if str(axis).lower().startswith("x"):
+            self.orbit_axis_x_pref = value
+        else:
+            self.orbit_axis_y_pref = value
+        try:
+            storage = getattr(self.page, "client_storage", None)
+            if not storage:
+                return
+            if value:
+                storage.set(key, value)
+            else:
+                remover = getattr(storage, "remove", None)
+                if callable(remover):
+                    remover(key)
+                else:
+                    storage.set(key, "")
+        except Exception:
+            pass
+
     def _collect_selected_signals(self) -> List[str]:
         try:
             return [
@@ -2371,6 +2397,39 @@ class MainApp:
             except Exception:
                 img_runup = None
 
+            img_orbit = None
+            try:
+                orbit_enabled = False
+                if getattr(self, 'orbit_cb', None):
+                    orbit_enabled = bool(getattr(self.orbit_cb, 'value', False))
+                else:
+                    orbit_enabled = bool(getattr(self, 'orbit_plot_enabled', False))
+                if orbit_enabled:
+                    x_col = getattr(self, 'orbit_x_dd', None).value if getattr(self, 'orbit_x_dd', None) else self.orbit_axis_x_pref
+                    y_col = getattr(self, 'orbit_y_dd', None).value if getattr(self, 'orbit_y_dd', None) else self.orbit_axis_y_pref
+                    if x_col and y_col and x_col in self.current_df.columns and y_col in self.current_df.columns:
+                        try:
+                            x_seg_pdf = self.current_df.loc[mask, x_col].to_numpy()
+                            y_seg_pdf = self.current_df.loc[mask, y_col].to_numpy()
+                        except Exception:
+                            x_seg_pdf = self.current_df[x_col].to_numpy()
+                            y_seg_pdf = self.current_df[y_col].to_numpy()
+                        orbit_fig = self._generate_orbit_figure(
+                            t_seg,
+                            x_seg_pdf,
+                            y_seg_pdf,
+                            x_col,
+                            y_col,
+                            fc,
+                            hide_lf,
+                            fmax_ui,
+                            False,
+                        )
+                        if orbit_fig is not None:
+                            img_orbit = save_plot(orbit_fig)
+            except Exception:
+                img_orbit = None
+
             aux_imgs = []
             aux_selected = []
             try:
@@ -2556,6 +2615,9 @@ class MainApp:
             if img_runup:
                 elements.append(Paragraph("Arranque/Paro - Cascada 3D", styles['Heading2']))
                 elements.append(Image(img_runup, width=400, height=180))
+            if img_orbit:
+                elements.append(Paragraph("Análisis de órbita", styles['Heading2']))
+                elements.append(Image(img_orbit, width=320, height=320))
 
             if aux_imgs:
                 elements.append(Paragraph("Variables auxiliares", styles['Heading2']))
@@ -4061,11 +4123,56 @@ class MainApp:
         self.hide_lf_cb = ft.Checkbox(label="Ocultar bajas frecuencias", value=True)
         self.lf_cutoff_field = ft.TextField(label="Corte LF (Hz)", value="0.5", width=100)
         self.hf_limit_field = ft.TextField(label="Máx FFT (Hz)", value="", width=120)
+        orbit_options = [ft.dropdown.Option(col) for col in available_signals]
+        default_orbit_x = (
+            self.orbit_axis_x_pref
+            if self.orbit_axis_x_pref in available_signals
+            else (available_signals[0] if available_signals else None)
+        )
+        default_orbit_y = (
+            self.orbit_axis_y_pref
+            if self.orbit_axis_y_pref in available_signals
+            else (
+                available_signals[1]
+                if len(available_signals) > 1
+                else (available_signals[0] if available_signals else None)
+            )
+        )
+        if default_orbit_y == default_orbit_x and len(available_signals) > 1:
+            for candidate in available_signals:
+                if candidate != default_orbit_x:
+                    default_orbit_y = candidate
+                    break
+        self._remember_orbit_axis("x", default_orbit_x)
+        self._remember_orbit_axis("y", default_orbit_y)
         self.runup_3d_cb = ft.Checkbox(
             label="Arranque/paro 3D",
             value=self.runup_3d_enabled,
             tooltip="Agrega cascada 3D para análisis de arranque y paro",
             on_change=self._on_runup_3d_toggle,
+        )
+        orbit_disabled = (not self.orbit_plot_enabled) or (len(available_signals) == 0)
+        self.orbit_cb = ft.Checkbox(
+            label="Análisis de órbita",
+            value=self.orbit_plot_enabled,
+            tooltip="Genera la órbita X-Y del rotor para evaluar restricciones de movimiento",
+            on_change=self._on_orbit_toggle,
+        )
+        self.orbit_x_dd = ft.Dropdown(
+            label="Órbita eje X",
+            options=orbit_options,
+            value=default_orbit_x,
+            width=200,
+            on_change=self._on_orbit_axis_change,
+            disabled=orbit_disabled,
+        )
+        self.orbit_y_dd = ft.Dropdown(
+            label="Órbita eje Y",
+            options=orbit_options,
+            value=default_orbit_y,
+            width=200,
+            on_change=self._on_orbit_axis_change,
+            disabled=orbit_disabled,
         )
         self.fft_zoom_text = ft.Text("Zoom FFT: completo", size=12)
         self.fft_zoom_slider = ft.RangeSlider(
@@ -4167,6 +4274,7 @@ class MainApp:
                 # Opciones de espectro (visual)
                 ft.Text("Opciones de espectro (visual):", size=14),
                 ft.Row([self.hide_lf_cb, self.lf_cutoff_field, self.hf_limit_field, self.runup_3d_cb], spacing=10, wrap=True),
+                ft.Row([self.orbit_cb, self.orbit_x_dd, self.orbit_y_dd], spacing=10, wrap=True),
                 ft.Column([self.fft_zoom_text, self.fft_zoom_slider], spacing=4),
                 ft.Row([self.db_scale_cb, self.sens_unit_dd, self.sensor_sens_field, self.gain_field], spacing=10),
                 ft.Row([self.db_ref_field, self.db_ymin_field, self.db_ymax_field], spacing=10),
@@ -4585,6 +4693,109 @@ class MainApp:
                 for tick in axis.get_ticklabels():
                     tick.set_color(axis_color)
             fig.colorbar(surf, ax=ax, shrink=0.6, pad=0.1, label="Velocidad [mm/s]")
+            fig.tight_layout()
+            return fig
+        except Exception:
+            return None
+
+    def _generate_orbit_figure(
+        self,
+        t_segment: np.ndarray,
+        x_segment: np.ndarray,
+        y_segment: np.ndarray,
+        x_label: str,
+        y_label: str,
+        fc: float,
+        hide_lf: bool,
+        fmax_ui: Optional[float],
+        dark_mode: bool,
+    ):
+        try:
+            t = np.asarray(t_segment, dtype=float).ravel()
+            x = np.asarray(x_segment, dtype=float).ravel()
+            y = np.asarray(y_segment, dtype=float).ravel()
+            if t.size < 32 or x.size != t.size or y.size != t.size:
+                return None
+            valid = np.isfinite(t) & np.isfinite(x) & np.isfinite(y)
+            if np.count_nonzero(valid) < 32:
+                return None
+            t = t[valid]
+            x = x[valid]
+            y = y[valid]
+            dt = None
+            if t.size > 1:
+                try:
+                    dt_val = float(np.median(np.diff(t)))
+                    if np.isfinite(dt_val) and dt_val > 0:
+                        dt = dt_val
+                except Exception:
+                    dt = None
+
+            def _band_filter(arr: np.ndarray) -> np.ndarray:
+                base = np.asarray(arr, dtype=float)
+                base = base - np.nanmean(base)
+                base = np.nan_to_num(base, nan=0.0, posinf=0.0, neginf=0.0)
+                if dt is None or base.size < 32:
+                    return base
+                spec = np.fft.rfft(base)
+                freqs = np.fft.rfftfreq(base.size, dt)
+                if hide_lf and fc and fc > 0:
+                    spec[freqs < max(0.0, float(fc))] = 0
+                if fmax_ui and fmax_ui > 0:
+                    spec[freqs > float(fmax_ui)] = 0
+                try:
+                    filtered = np.fft.irfft(spec, n=base.size)
+                except Exception:
+                    filtered = base
+                return filtered
+
+            x_filt = _band_filter(x)
+            y_filt = _band_filter(y)
+            if x_filt.size > 6000:
+                idx = np.linspace(0, x_filt.size - 1, 3000, dtype=int)
+                x_filt = x_filt[idx]
+                y_filt = y_filt[idx]
+            face = "#0f141b" if dark_mode else "white"
+            fig, ax = plt.subplots(figsize=(6, 6))
+            fig.patch.set_facecolor(face)
+            ax.set_facecolor(face)
+            accent = self._accent_ui()
+            ax.plot(x_filt, y_filt, color=accent, linewidth=1.4, alpha=0.9)
+            progress = np.linspace(0.0, 1.0, x_filt.size)
+            sc = ax.scatter(
+                x_filt,
+                y_filt,
+                c=progress,
+                cmap="plasma",
+                s=10,
+                alpha=0.6,
+                linewidths=0,
+            )
+            try:
+                ax.scatter([x_filt[0]], [y_filt[0]], color="#2ecc71", s=50, label="Inicio")
+                ax.scatter([x_filt[-1]], [y_filt[-1]], color="#e74c3c", s=50, label="Fin")
+                ax.legend(loc="upper right", fontsize=8)
+            except Exception:
+                pass
+            ax.set_title("Análisis de órbita")
+            ax.set_xlabel(x_label or "Canal X")
+            ax.set_ylabel(y_label or "Canal Y")
+            ax.set_aspect("equal", adjustable="datalim")
+            grid_color = "#34495e" if dark_mode else "#bdc3c7"
+            ax.grid(True, linestyle="--", alpha=0.25 if dark_mode else 0.35, color=grid_color)
+            axis_color = "white" if dark_mode else "black"
+            ax.xaxis.label.set_color(axis_color)
+            ax.yaxis.label.set_color(axis_color)
+            ax.title.set_color(axis_color)
+            for axis in [ax.xaxis, ax.yaxis]:
+                for tick in axis.get_ticklabels():
+                    tick.set_color(axis_color)
+            cbar = fig.colorbar(sc, ax=ax, shrink=0.8, pad=0.015)
+            cbar.set_label("Progreso temporal")
+            if dark_mode:
+                cbar.ax.yaxis.label.set_color("white")
+                for tick in cbar.ax.get_yticklabels():
+                    tick.set_color("white")
             fig.tight_layout()
             return fig
         except Exception:
@@ -5661,6 +5872,40 @@ class MainApp:
             except Exception:
                 env_chart = None
 
+            orbit_chart = None
+            try:
+                orbit_enabled = False
+                if getattr(self, 'orbit_cb', None):
+                    orbit_enabled = bool(getattr(self.orbit_cb, 'value', False))
+                else:
+                    orbit_enabled = bool(getattr(self, 'orbit_plot_enabled', False))
+                if orbit_enabled:
+                    x_col = getattr(self, 'orbit_x_dd', None).value if getattr(self, 'orbit_x_dd', None) else self.orbit_axis_x_pref
+                    y_col = getattr(self, 'orbit_y_dd', None).value if getattr(self, 'orbit_y_dd', None) else self.orbit_axis_y_pref
+                    if x_col and y_col and x_col in self.current_df.columns and y_col in self.current_df.columns:
+                        try:
+                            x_seg = self.current_df.loc[mask, x_col].to_numpy()
+                            y_seg = self.current_df.loc[mask, y_col].to_numpy()
+                        except Exception:
+                            x_seg = self.current_df[x_col].to_numpy()
+                            y_seg = self.current_df[y_col].to_numpy()
+                        orbit_fig = self._generate_orbit_figure(
+                            t_segment,
+                            x_seg,
+                            y_seg,
+                            x_col,
+                            y_col,
+                            fc,
+                            hide_lf,
+                            fmax_ui,
+                            self.is_dark_mode,
+                        )
+                        if orbit_fig is not None:
+                            orbit_chart = MatplotlibChart(orbit_fig, expand=True, isolated=True)
+                            plt.close(orbit_fig)
+            except Exception:
+                orbit_chart = None
+
             runup_chart = None
             try:
                 if getattr(self, 'runup_3d_cb', None) and getattr(self.runup_3d_cb, 'value', False):
@@ -5824,6 +6069,7 @@ class MainApp:
                     chart
                 ]
                     + ([runup_chart] if runup_chart else [])
+                    + ([orbit_chart] if orbit_chart else [])
                     + ([env_chart] if 'env_chart' in locals() and env_chart else [])
                     + aux_plots,
                 spacing=20,
@@ -7137,6 +7383,59 @@ class MainApp:
             self.page.client_storage.set("runup_3d_enabled", self.runup_3d_enabled)
         except Exception:
             pass
+        self._update_analysis()
+
+
+    def _refresh_orbit_inputs(self):
+        ctrl_x = getattr(self, 'orbit_x_dd', None)
+        ctrl_y = getattr(self, 'orbit_y_dd', None)
+        try:
+            enabled = bool(getattr(self, 'orbit_cb', None).value)
+        except Exception:
+            enabled = bool(getattr(self, 'orbit_plot_enabled', False))
+        try:
+            options_available = bool(getattr(ctrl_x, 'options', []) or getattr(ctrl_y, 'options', []))
+            if isinstance(getattr(ctrl_x, 'options', None), list):
+                options_available = options_available and len(ctrl_x.options) > 0
+            if isinstance(getattr(ctrl_y, 'options', None), list):
+                options_available = options_available and len(ctrl_y.options) > 0
+        except Exception:
+            options_available = False
+        disabled = (not enabled) or (not options_available)
+        for ctrl in (ctrl_x, ctrl_y):
+            if ctrl is None:
+                continue
+            try:
+                ctrl.disabled = disabled
+                if ctrl.page:
+                    ctrl.update()
+            except Exception:
+                continue
+
+    def _on_orbit_toggle(self, e=None):
+        try:
+            enabled = bool(getattr(self, 'orbit_cb', None).value)
+        except Exception:
+            enabled = False
+        self.orbit_plot_enabled = enabled
+        try:
+            self.page.client_storage.set("orbit_plot_enabled", self.orbit_plot_enabled)
+        except Exception:
+            pass
+        self._refresh_orbit_inputs()
+        self._update_analysis()
+
+    def _on_orbit_axis_change(self, e=None):
+        ctrl = getattr(e, 'control', None) if e else None
+        value = getattr(ctrl, 'value', None) if ctrl else None
+        if ctrl is getattr(self, 'orbit_x_dd', None):
+            self._remember_orbit_axis('x', value if value else None)
+        elif ctrl is getattr(self, 'orbit_y_dd', None):
+            self._remember_orbit_axis('y', value if value else None)
+        else:
+            return
+        if self.orbit_cb and not getattr(self.orbit_cb, 'value', False):
+            return
         self._update_analysis()
 
 
