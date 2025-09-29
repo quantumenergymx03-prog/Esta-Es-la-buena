@@ -221,13 +221,56 @@ def prepare_orbit(
 
     x = np.asarray(x, dtype=float).ravel()
     y = np.asarray(y, dtype=float).ravel()
-    t = np.asarray(t, dtype=float).ravel()
+    t_input = np.asarray(t)
+    if t_input.size:
+        try:
+            if np.issubdtype(t_input.dtype, np.datetime64):
+                t_dt = t_input.astype("datetime64[ns]")
+                mask = ~np.isnat(t_dt)
+                if np.any(mask):
+                    ref = t_dt[mask][0]
+                    deltas = (t_dt - ref).astype("timedelta64[ns]")
+                    t_input = (deltas / np.timedelta64(1, "s")).astype(float)
+                else:
+                    t_input = np.arange(t_input.size, dtype=float)
+            elif np.issubdtype(t_input.dtype, np.timedelta64):
+                td = t_input.astype("timedelta64[ns]")
+                t_input = (td / np.timedelta64(1, "s")).astype(float)
+            else:
+                t_input = t_input.astype(float)
+        except (TypeError, ValueError):
+            try:
+                t_dt = pd.to_datetime(t_input, errors="coerce")
+                t_np = t_dt.to_numpy(dtype="datetime64[ns]") if hasattr(t_dt, "to_numpy") else np.asarray(t_dt, dtype="datetime64[ns]")
+                mask = ~np.isnat(t_np)
+                if np.any(mask):
+                    ref = t_np[mask][0]
+                    deltas = (t_np - ref).astype("timedelta64[ns]")
+                    t_input = (deltas / np.timedelta64(1, "s")).astype(float)
+                else:
+                    raise ValueError
+            except Exception:
+                t_input = np.arange(t_input.size, dtype=float)
+    else:
+        t_input = np.asarray([], dtype=float)
+
+    t = np.asarray(t_input, dtype=float).ravel()
+    if t.size and np.isfinite(t).any():
+        first_valid_t = t[np.isfinite(t)][0]
+        t = t - first_valid_t
 
     if x.size == 0 or y.size == 0 or t.size == 0:
         return x, y, f1, float(fs or 0.0)
 
     if fs is None:
-        dt = float(np.mean(np.diff(t))) if t.size > 1 else 0.0
+        if t.size > 1:
+            finite_t = t[np.isfinite(t)]
+            if finite_t.size > 1:
+                dt = float(np.mean(np.diff(finite_t)))
+            else:
+                dt = 0.0
+        else:
+            dt = 0.0
         fs = 1.0 / dt if dt > 0 else 0.0
     fs = float(fs)
 
