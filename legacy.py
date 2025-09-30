@@ -211,124 +211,242 @@ def prepare_orbit(
     sensitivity_x: float = 1.0,
     sensitivity_y: float = 1.0,
     axis_rotation_deg: float = 0.0,
-) -> Tuple[np.ndarray, np.ndarray, Optional[float], float]:
+) -> Tuple[np.ndarray, np.ndarray, Optional[float], float, str]:
     """Prepara señales X/Y para análisis orbital.
 
-    Se aplican sensibilidades, detrend, filtrado alrededor de 1X y una
-    rotación opcional de ejes. Devuelve las señales filtradas junto con la
-    estimación de 1X y la frecuencia de muestreo efectiva.
+    Se aplican sensibilidades, conversión de unidades hacia el objetivo deseado
+    (velocidad o desplazamiento), detrend, filtrado alrededor de 1X y una
+    rotación opcional de ejes. Devuelve las señales procesadas junto con la
+    estimación de 1X, la frecuencia de muestreo efectiva y las unidades finales.
     """
 
-    x = np.asarray(x, dtype=float).ravel()
-    y = np.asarray(y, dtype=float).ravel()
-    t_input = np.asarray(t)
-    if t_input.size:
+    def _to_seconds(arr: np.ndarray) -> np.ndarray:
+        if arr.size == 0:
+            return np.asarray([], dtype=float)
         try:
-            if np.issubdtype(t_input.dtype, np.datetime64):
-                t_dt = t_input.astype("datetime64[ns]")
-                mask = ~np.isnat(t_dt)
+            if np.issubdtype(arr.dtype, np.datetime64):
+                arr = arr.astype("datetime64[ns]")
+                mask = ~np.isnat(arr)
                 if np.any(mask):
-                    ref = t_dt[mask][0]
-                    deltas = (t_dt - ref).astype("timedelta64[ns]")
-                    t_input = (deltas / np.timedelta64(1, "s")).astype(float)
-                else:
-                    t_input = np.arange(t_input.size, dtype=float)
-            elif np.issubdtype(t_input.dtype, np.timedelta64):
-                td = t_input.astype("timedelta64[ns]")
-                t_input = (td / np.timedelta64(1, "s")).astype(float)
-            else:
-                t_input = t_input.astype(float)
+                    ref = arr[mask][0]
+                    delta = (arr - ref).astype("timedelta64[ns]")
+                    return (delta / np.timedelta64(1, "s")).astype(float)
+                return np.arange(arr.size, dtype=float)
+            if np.issubdtype(arr.dtype, np.timedelta64):
+                delta = arr.astype("timedelta64[ns]")
+                return (delta / np.timedelta64(1, "s")).astype(float)
+            return arr.astype(float)
         except (TypeError, ValueError):
             try:
-                t_dt = pd.to_datetime(t_input, errors="coerce")
+                t_dt = pd.to_datetime(arr, errors="coerce")
                 t_np = t_dt.to_numpy(dtype="datetime64[ns]") if hasattr(t_dt, "to_numpy") else np.asarray(t_dt, dtype="datetime64[ns]")
                 mask = ~np.isnat(t_np)
                 if np.any(mask):
                     ref = t_np[mask][0]
-                    deltas = (t_np - ref).astype("timedelta64[ns]")
-                    t_input = (deltas / np.timedelta64(1, "s")).astype(float)
-                else:
-                    raise ValueError
+                    delta = (t_np - ref).astype("timedelta64[ns]")
+                    return (delta / np.timedelta64(1, "s")).astype(float)
             except Exception:
-                t_input = np.arange(t_input.size, dtype=float)
-    else:
-        t_input = np.asarray([], dtype=float)
+                pass
+            return np.arange(arr.size, dtype=float)
 
-    t = np.asarray(t_input, dtype=float).ravel()
-    if t.size and np.isfinite(t).any():
-        first_valid_t = t[np.isfinite(t)][0]
-        t = t - first_valid_t
+    def _infer_kind(unit_str: str) -> str:
+        u = (unit_str or "").strip().lower()
+        if "s^2" in u or "/s2" in u or "g" in u:
+            return "acc"
+        if "/s" in u or "per second" in u or "ips" in u:
+            return "vel"
+        return "disp"
 
-    if x.size == 0 or y.size == 0 or t.size == 0:
-        return x, y, f1, float(fs or 0.0)
+    def _to_si_scale(unit_str: str, kind: str) -> float:
+        u = (unit_str or "").strip().lower()
+        if kind == "acc":
+            if "g" in u:
+                return 9.80665
+            if "mm" in u:
+                return 1e-3
+            if "µ" in u or "um" in u:
+                return 1e-6
+            return 1.0
+        if kind == "vel":
+            if "ips" in u or "in/s" in u or "inch" in u:
+                return 0.0254
+            if "mm" in u:
+                return 1e-3
+            if "µ" in u or "um" in u:
+                return 1e-6
+            return 1.0
+        if kind == "disp":
+            if "mil" in u:
+                return 2.54e-5
+            if "inch" in u or "in" in u:
+                return 0.0254
+            if "mm" in u:
+                return 1e-3
+            if "µ" in u or "um" in u:
+                return 1e-6
+            return 1.0
+        return 1.0
 
-    if fs is None:
-        if t.size > 1:
-            finite_t = t[np.isfinite(t)]
-            if finite_t.size > 1:
-                dt = float(np.mean(np.diff(finite_t)))
+    def _convert_kind(sig: np.ndarray, base_kind: str, target_kind: str, fs_hz: float) -> np.ndarray:
+        if sig.size < 2 or not (fs_hz and np.isfinite(fs_hz) and fs_hz > 0):
+            return sig
+        order_map = {"disp": 0, "vel": 1, "acc": 2}
+        base_idx = order_map.get(base_kind, 1)
+        target_idx = order_map.get(target_kind, 1)
+        if base_idx == target_idx:
+            return sig
+        spec = np.fft.rfft(sig)
+        freqs = np.fft.rfftfreq(sig.size, d=1.0 / fs_hz)
+        diff = target_idx - base_idx
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            if diff > 0:
+                factor = (1j * 2.0 * np.pi * freqs) ** diff
+                spec *= factor
+                spec[0] = 0.0
             else:
-                dt = 0.0
+                diff = -diff
+                factor = (1j * 2.0 * np.pi * freqs) ** diff
+                spec[1:] /= factor[1:]
+                spec[0] = 0.0
+        converted = np.fft.irfft(spec, n=sig.size)
+        return converted.real
+
+    x_arr = np.asarray(x, dtype=float).ravel()
+    y_arr = np.asarray(y, dtype=float).ravel()
+    n = min(x_arr.size, y_arr.size)
+    if n == 0:
+        return x_arr, y_arr, f1, float(fs or 0.0), ""
+    x_arr = x_arr[:n]
+    y_arr = y_arr[:n]
+
+    t_input = np.asarray(t)
+    if t_input.size:
+        t_input = t_input[:n]
+        t_sec = _to_seconds(t_input)
+    else:
+        t_sec = np.asarray([], dtype=float)
+
+    if t_sec.size:
+        mask = np.isfinite(x_arr) & np.isfinite(y_arr) & np.isfinite(t_sec)
+        x_arr = x_arr[mask]
+        y_arr = y_arr[mask]
+        t_sec = t_sec[mask]
+        if t_sec.size > 1:
+            order = np.argsort(t_sec)
+            if not np.all(order == np.arange(order.size)):
+                x_arr = x_arr[order]
+                y_arr = y_arr[order]
+                t_sec = t_sec[order]
+            dt = np.diff(t_sec)
+            valid_dt = dt > 0
+            if not np.all(valid_dt):
+                keep = np.ones_like(t_sec, dtype=bool)
+                keep[1:] = valid_dt
+                x_arr = x_arr[keep]
+                y_arr = y_arr[keep]
+                t_sec = t_sec[keep]
+    else:
+        mask = np.isfinite(x_arr) & np.isfinite(y_arr)
+        x_arr = x_arr[mask]
+        y_arr = y_arr[mask]
+
+    if x_arr.size == 0 or y_arr.size == 0:
+        return x_arr, y_arr, f1, float(fs or 0.0), ""
+
+    if t_sec.size and np.isfinite(t_sec).any():
+        t_sec = t_sec - t_sec[np.isfinite(t_sec)][0]
+
+    if fs is None or not np.isfinite(fs) or fs <= 0:
+        if t_sec.size > 1:
+            diffs = np.diff(t_sec)
+            diffs = diffs[np.isfinite(diffs) & (diffs > 0)]
+            dt = float(np.median(diffs)) if diffs.size else 0.0
+            fs_est = 1.0 / dt if dt > 0 else 0.0
         else:
-            dt = 0.0
-        fs = 1.0 / dt if dt > 0 else 0.0
-    fs = float(fs)
+            fs_est = 0.0
+        fs = fs_est
+    fs = float(fs if fs is not None else 0.0)
 
-    # Aplicar sensibilidades para igualar ganancia entre sondas
-    x = x * float(sensitivity_x)
-    y = y * float(sensitivity_y)
+    # Aplicar sensibilidades
+    x_arr = x_arr * float(sensitivity_x)
+    y_arr = y_arr * float(sensitivity_y)
 
-    # Detrend lineal + remover media para evitar órbitas desplazadas
+    base_kind = _infer_kind(units)
+    target_kind = "vel" if str(target).lower().startswith("vel") else "disp"
+
+    scale_si = _to_si_scale(units, base_kind)
+    if scale_si != 0:
+        x_arr = x_arr * scale_si
+        y_arr = y_arr * scale_si
+
+    x_arr = _convert_kind(x_arr, base_kind, target_kind, fs)
+    y_arr = _convert_kind(y_arr, base_kind, target_kind, fs)
+
+    # Convertir a unidades finales legibles
+    if target_kind == "vel":
+        out_units = "mm/s"
+        x_arr = x_arr * 1000.0
+        y_arr = y_arr * 1000.0
+    else:
+        out_units = "mm"
+        x_arr = x_arr * 1000.0
+        y_arr = y_arr * 1000.0
+
     try:
-        x = signal.detrend(x - float(np.mean(x)), type="linear")
-        y = signal.detrend(y - float(np.mean(y)), type="linear")
+        x_arr = signal.detrend(x_arr - float(np.mean(x_arr)), type="linear")
+        y_arr = signal.detrend(y_arr - float(np.mean(y_arr)), type="linear")
     except Exception:
-        x = x - float(np.mean(x))
-        y = y - float(np.mean(y))
+        x_arr = x_arr - float(np.mean(x_arr))
+        y_arr = y_arr - float(np.mean(y_arr))
 
-    # Estimar 1X si no se proporciona
     if f1 is None or not np.isfinite(f1) or f1 <= 0:
-        n = min(len(x), len(y))
-        if n >= 8:
-            freqs = np.fft.rfftfreq(n, d=1.0 / fs) if fs > 0 else np.fft.rfftfreq(n)
-            X = np.abs(np.fft.rfft(x[:n]))
-            Y = np.abs(np.fft.rfft(y[:n]))
+        n_fft = min(len(x_arr), len(y_arr))
+        if n_fft >= 8:
+            if fs > 0:
+                freqs = np.fft.rfftfreq(n_fft, d=1.0 / fs)
+            else:
+                freqs = np.fft.rfftfreq(n_fft)
+            X = np.abs(np.fft.rfft(x_arr[:n_fft]))
+            Y = np.abs(np.fft.rfft(y_arr[:n_fft]))
             P = X + Y
             if fs > 0:
                 mask = (freqs >= 5.0) & (freqs <= 0.45 * fs)
                 if np.any(mask):
                     f1 = float(freqs[mask][np.argmax(P[mask])])
+                elif freqs.size:
+                    f1 = float(freqs[np.argmax(P)])
                 else:
-                    f1 = float(freqs[np.argmax(P)]) if freqs.size else None
+                    f1 = None
+            elif freqs.size:
+                f1 = float(freqs[np.argmax(P)])
             else:
-                f1 = float(freqs[np.argmax(P)]) if freqs.size else None
+                f1 = None
         else:
             f1 = None
 
-    # Filtro band-pass alrededor de 1X
     if fs > 0 and f1 and np.isfinite(f1) and f1 > 0:
         bw = max(0.0, float(bw_factor))
         low = max(0.1, f1 * (1.0 - bw))
         high = min(0.475 * fs, f1 * (1.0 + bw))
         if high > low and high < 0.5 * fs:
             sos = signal.butter(4, [low, high], btype="bandpass", fs=fs, output="sos")
-            x = signal.sosfiltfilt(sos, x)
-            y = signal.sosfiltfilt(sos, y)
+            x_arr = signal.sosfiltfilt(sos, x_arr)
+            y_arr = signal.sosfiltfilt(sos, y_arr)
 
-    # Rotación de ejes si las sondas no están a 90° exactos
     if axis_rotation_deg:
         th = np.deg2rad(float(axis_rotation_deg))
-        xr = np.cos(th) * x - np.sin(th) * y
-        yr = np.sin(th) * x + np.cos(th) * y
-        x, y = xr, yr
+        xr = np.cos(th) * x_arr - np.sin(th) * y_arr
+        yr = np.sin(th) * x_arr + np.cos(th) * y_arr
+        x_arr, y_arr = xr, yr
 
-    return x, y, f1, fs
+    return x_arr, y_arr, f1, fs, out_units
 
 
 def plot_orbit(
     x: np.ndarray,
     y: np.ndarray,
     title: str = "Órbita (X vs Y)",
+    units: str = "",
 ) -> Tuple[plt.Figure, plt.Axes]:
     """Genera figura Matplotlib para órbita X-Y con aspecto 1:1."""
 
@@ -339,8 +457,9 @@ def plot_orbit(
     ax.set_aspect("equal", adjustable="box")
     ax.axhline(0.0, lw=0.6, color="k")
     ax.axvline(0.0, lw=0.6, color="k")
-    ax.set_xlabel("X")
-    ax.set_ylabel("Y")
+    label = f"X [{units}]" if units else "X"
+    ax.set_xlabel(label)
+    ax.set_ylabel(label.replace("X", "Y", 1) if units else "Y")
     ax.set_title(title)
     r = 1.05 * max(float(np.max(np.abs(x))) if x.size else 1.0,
                    float(np.max(np.abs(y))) if y.size else 1.0)
@@ -5788,7 +5907,7 @@ class MainApp:
                             except Exception:
                                 target = 'vel'
                             bw_factor = max(0.0, min(1.0, bw_percent / 100.0))
-                            x_orbit, y_orbit, f1_used, fs_used = prepare_orbit(
+                            x_orbit, y_orbit, f1_used, fs_used, orbit_units = prepare_orbit(
                                 x_seg,
                                 y_seg,
                                 t_seg_orbit,
@@ -5803,7 +5922,9 @@ class MainApp:
                             title = "Órbita X-Y"
                             if f1_used and np.isfinite(f1_used) and f1_used > 0:
                                 title = f"Órbita X-Y (1X≈{f1_used:.2f} Hz)"
-                            orbit_fig, _ = plot_orbit(x_orbit, y_orbit, title=title)
+                            if orbit_units:
+                                title = f"{title} [{orbit_units}]"
+                            orbit_fig, _ = plot_orbit(x_orbit, y_orbit, title=title, units=orbit_units)
                             orbit_chart = MatplotlibChart(orbit_fig, expand=True, isolated=True)
                             plt.close(orbit_fig)
                             info_lines = []
@@ -5812,6 +5933,8 @@ class MainApp:
                             if fs_used and np.isfinite(fs_used) and fs_used > 0:
                                 info_lines.append(f"fs órbita: {fs_used:.1f} Hz")
                             info_lines.append(f"Filtro ±{bw_factor * 100:.0f}% alrededor de 1X")
+                            if orbit_units:
+                                info_lines.append(f"Unidades: {orbit_units}")
                             orbit_text = ft.Text(" | ".join(info_lines), size=12)
                             orbit_section = ft.Column([orbit_text, orbit_chart], spacing=6)
                 except Exception as ex:
